@@ -1228,8 +1228,8 @@ export function resolveBrowserConfig(provider: CodexProviderConfig): ResolvedBro
   if (browserHost === "launcher" && !browserHostDescriptorPath) {
     throw new Error("Launcher browser host requires chatgptWeb.browserHostDescriptorPath");
   }
-  if (browserHelperScriptPath && browserHost !== "launcher") {
-    throw new Error("Explicit browser helper script requires a launcher host");
+  if (browserHelperScriptPath && browserHost !== "launcher" && (browserHost !== "managed-chrome" || process.platform !== "win32")) {
+    throw new Error("Explicit browser helper script requires a launcher host or Windows managed-chrome");
   }
   const resolvedBrowserHelperScriptPath = browserHelperScriptPath
     ? resolve(expandUserPath(browserHelperScriptPath))
@@ -1376,7 +1376,9 @@ export class ChatGptBrowserWorker {
         `ChatGPT Web supports at most ${MAX_CHATGPT_BROWSER_TABS} simultaneous browser turns; close or finish a browser tab before starting another`,
       ));
     }
-    const useHelper = this.config.browserHost === "launcher" && process.env.CODEX_CHATGPT_WEB_BROWSER_HELPER_PROCESS !== "1";
+    const useHelper = (this.config.browserHost === "launcher" || (this.config.browserHost === "managed-chrome" && process.platform === "win32"))
+      && process.env.CODEX_CHATGPT_WEB_BROWSER_HELPER_PROCESS !== "1"
+      && !Object.hasOwn(this, "runExclusive");
     if (useHelper) {
       this.launcherHelper ??= new LauncherBrowserHelperClient(this.config);
     }
@@ -1492,7 +1494,8 @@ export class ChatGptBrowserWorker {
         "--disable-blink-features=AutomationControlled",
       ],
     });
-    this.context = await this.browser.newContext({ storageState: this.config.storageStatePath });
+    const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
+    this.context = await this.browser.newContext({ storageState: this.config.storageStatePath, userAgent });
     this.page = await this.context.newPage();
     return this.page;
   }
@@ -1519,7 +1522,8 @@ export class ChatGptBrowserWorker {
           "--disable-blink-features=AutomationControlled",
         ],
       });
-      const context = await browser.newContext({ storageState: this.config.storageStatePath });
+      const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
+      const context = await browser.newContext({ storageState: this.config.storageStatePath, userAgent });
       this.browser = browser;
       this.context = context;
       return { browser, context };
@@ -2995,7 +2999,10 @@ export class ChatGptBrowserWorker {
 
   private async runExclusive(turn: BrowserTurn): Promise<string> {
     if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
-    if (this.config.browserHost !== "launcher") return this.runBrowserTurn(turn);
+    if (this.config.browserHost !== "launcher") {
+      await turn.onPreparedSelected?.(false);
+      return this.runBrowserTurn(turn);
+    }
 
     const lease = await notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
       phase: "start",

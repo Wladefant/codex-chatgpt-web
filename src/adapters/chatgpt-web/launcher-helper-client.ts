@@ -1,4 +1,6 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { existsSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { notifyLauncherTurn, readLauncherBrowserHostDescriptor } from "../../launcher-browser-host";
 import { ChatGptWebAdapterError } from "./adapter-error";
@@ -184,7 +186,11 @@ export class LauncherBrowserHelperClient {
           id: turn.traceId,
           config: {
             appName: this.config.appName,
-            browserHostDescriptorPath: this.config.browserHostDescriptorPath!,
+            browserHost: this.config.browserHost,
+            browserHostDescriptorPath: this.config.browserHostDescriptorPath,
+            chromeExecutablePath: this.config.chromeExecutablePath,
+            storageStatePath: this.config.storageStatePath,
+            headed: this.config.headed,
             browserDiagnosticsPath: this.config.browserDiagnosticsPath,
             turnTimeoutMs: this.config.turnTimeoutMs,
             autoApproveToolCalls: this.config.autoApproveToolCalls,
@@ -220,6 +226,35 @@ export class LauncherBrowserHelperClient {
     await this.terminateChild(child, 2_000);
   }
 
+  private resolveManagedBrowserHelperScript(): string {
+    if (this.config.browserHelperScriptPath && existsSync(this.config.browserHelperScriptPath)) {
+      return this.config.browserHelperScriptPath;
+    }
+    const root = resolve(import.meta.dir, "..", "..", "..");
+    const candidates = [
+      resolve(root, ".launcher-runtime", "browser-helper.cjs"),
+      resolve(root, "dist", "runtime", "app", "browser-helper.cjs"),
+      resolve(root, "dist", "browser-helper.cjs"),
+      resolve(import.meta.dir, "browser-helper.cjs"),
+    ];
+    for (const candidate of candidates) {
+      if (existsSync(candidate)) return candidate;
+    }
+    const buildScript = join(root, "scripts", "build-browser-helper.ts");
+    if (existsSync(buildScript)) {
+      const output = join(root, ".launcher-runtime", "browser-helper.cjs");
+      const bunExe = typeof Bun !== "undefined" ? process.execPath : "bun";
+      const build = spawnSync(bunExe, ["run", buildScript, output], {
+        cwd: root,
+        stdio: "pipe",
+      });
+      if (build.status === 0 && existsSync(output)) {
+        return output;
+      }
+    }
+    throw new Error("ChatGPT Web managed browser helper script could not be found or built");
+  }
+
   private async ensureChild(): Promise<void> {
     if (this.child
       && !this.child.killed
@@ -228,16 +263,31 @@ export class LauncherBrowserHelperClient {
       && this.ready) {
       return this.ready;
     }
-    const descriptor = readLauncherBrowserHostDescriptor(this.config.browserHostDescriptorPath!);
+    let executable: string;
+    let script: string;
+    let env: Record<string, string | undefined>;
+    if (this.config.browserHost === "launcher") {
+      const descriptor = readLauncherBrowserHostDescriptor(this.config.browserHostDescriptorPath!);
+      executable = descriptor.helper.executable;
+      script = this.config.browserHelperScriptPath ?? descriptor.helper.script;
+      env = {
+        ...process.env,
+        ELECTRON_RUN_AS_NODE: "1",
+        CODEX_CHATGPT_WEB_BROWSER_HELPER_PROCESS: "1",
+      };
+    } else {
+      executable = "node";
+      script = this.resolveManagedBrowserHelperScript();
+      env = {
+        ...process.env,
+        CODEX_CHATGPT_WEB_BROWSER_HELPER_PROCESS: "1",
+      };
+    }
     const child = spawn(
-      descriptor.helper.executable,
-      [this.config.browserHelperScriptPath ?? descriptor.helper.script],
+      executable,
+      [script],
       {
-        env: {
-          ...process.env,
-          ELECTRON_RUN_AS_NODE: "1",
-          CODEX_CHATGPT_WEB_BROWSER_HELPER_PROCESS: "1",
-        },
+        env,
         stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true,
       },

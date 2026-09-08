@@ -13,7 +13,11 @@ interface RunMessage {
   id: string;
   config: {
     appName: string;
-    browserHostDescriptorPath: string;
+    browserHost?: "launcher" | "managed-chrome";
+    browserHostDescriptorPath?: string;
+    chromeExecutablePath?: string;
+    storageStatePath?: string;
+    headed?: boolean;
     browserDiagnosticsPath?: string;
     turnTimeoutMs: number;
     autoApproveToolCalls: boolean;
@@ -153,8 +157,11 @@ async function run(message: RunMessage): Promise<void> {
     baseUrl: "https://chatgpt.com",
     chatgptWeb: {
       appName: message.config.appName,
-      browserHost: "launcher",
+      browserHost: message.config.browserHost ?? (message.config.browserHostDescriptorPath ? "launcher" : "managed-chrome"),
       browserHostDescriptorPath: message.config.browserHostDescriptorPath,
+      chromeExecutablePath: message.config.chromeExecutablePath,
+      storageStatePath: message.config.storageStatePath,
+      headed: message.config.headed,
       browserDiagnosticsPath: message.config.browserDiagnosticsPath,
       turnTimeoutMs: message.config.turnTimeoutMs,
       autoApproveToolCalls: message.config.autoApproveToolCalls,
