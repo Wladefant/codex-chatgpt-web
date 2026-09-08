@@ -21,6 +21,14 @@ turndown.addRule("removeSvg", {
   filter: node => node.nodeName === "SVG",
   replacement: () => "",
 });
+turndown.addRule("linkInlineFilePaths", {
+  filter: node => inlineFilePath(node) !== undefined,
+  replacement: (_content, node) => {
+    const path = node.textContent!;
+    const target = path.replaceAll("\\", "/");
+    return `[${path}](<${target}>)`;
+  },
+});
 turndown.addRule("compactListItem", {
   filter: "li",
   replacement: (content, node, options) => {
@@ -38,14 +46,92 @@ turndown.addRule("compactListItem", {
   },
 });
 
+function inlineFilePath(node: Node): string | undefined {
+  if (node.nodeName !== "CODE") return undefined;
+  for (let ancestor = node.parentNode; ancestor; ancestor = ancestor.parentNode) {
+    if (["A", "PRE"].includes(ancestor.nodeName)) return undefined;
+  }
+
+  const path = node.textContent ?? "";
+  if (path !== path.trim() || /[\s`<>()[\]]/.test(path)) return undefined;
+  if (/^[a-z][a-z\d+.-]*:\/\//i.test(path)) return undefined;
+
+  const withoutLocation = path.replace(/:\d+(?::\d+)?$/, "");
+  const separator = Math.max(withoutLocation.lastIndexOf("/"), withoutLocation.lastIndexOf("\\"));
+  if (separator < 0) return undefined;
+
+  const basename = withoutLocation.slice(separator + 1);
+  if (!/\.[a-z\d][a-z\d._-]*$/i.test(basename)) return undefined;
+  return path;
+}
+
 function preserveObsidianWikiLinks(markdown: string): string {
   // Turndown escapes literal brackets, but Codex interprets the resulting `\[` as LaTeX.
-  // Double-bracket wiki links are already plain GFM text, so preserve only that exact syntax.
+  // Restore the source syntax before converting it into a regular Markdown file link.
   return markdown.replace(/\\\[\\\[([^\r\n]*?)\\\]\\\]/g, "[[$1]]");
 }
 
+function obsidianWikiLink(value: string): string | undefined {
+  const separator = value.indexOf("|");
+  const target = (separator >= 0 ? value.slice(0, separator) : value).trim();
+  const label = (separator >= 0 ? value.slice(separator + 1) : value).trim();
+  if (!target || !label || /[<>]/.test(target)) return undefined;
+
+  const fragmentAt = target.indexOf("#");
+  const note = fragmentAt >= 0 ? target.slice(0, fragmentAt) : target;
+  const fragment = fragmentAt >= 0 ? target.slice(fragmentAt) : "";
+  const extension = note.slice(note.lastIndexOf("/") + 1).includes(".");
+  const path = note && !extension ? `${note}.md` : note;
+  return `[${label}](<${path}${fragment}>)`;
+}
+
+function linkObsidianWikiLinks(markdown: string): string {
+  let fence: { marker: "`" | "~"; length: number } | undefined;
+  return markdown.split("\n").map(line => {
+    const fenceRun = line.match(/^ {0,3}(`{3,}|~{3,})/)?.[1];
+    if (fence) {
+      const closingRun = line.match(/^ {0,3}(`{3,}|~{3,})[ \t]*$/)?.[1];
+      if (closingRun?.[0] === fence.marker && closingRun.length >= fence.length) fence = undefined;
+      return line;
+    }
+    if (fenceRun) {
+      fence = { marker: fenceRun[0] as "`" | "~", length: fenceRun.length };
+      return line;
+    }
+
+    let result = "";
+    let inlineCodeTicks = 0;
+    for (let index = 0; index < line.length;) {
+      if (line[index] === "`") {
+        let end = index + 1;
+        while (line[end] === "`") end += 1;
+        const ticks = end - index;
+        inlineCodeTicks = inlineCodeTicks === 0 ? ticks : ticks === inlineCodeTicks ? 0 : inlineCodeTicks;
+        result += line.slice(index, end);
+        index = end;
+        continue;
+      }
+      if (inlineCodeTicks === 0 && line.startsWith("[[", index) && line[index - 1] !== "!") {
+        const end = line.indexOf("]]", index + 2);
+        if (end >= 0) {
+          const linked = obsidianWikiLink(line.slice(index + 2, end));
+          if (linked) {
+            result += linked;
+            index = end + 2;
+            continue;
+          }
+        }
+      }
+      result += line[index];
+      index += 1;
+    }
+    return result;
+  }).join("\n");
+}
+
 export function chatGptHtmlToMarkdown(html: string): string {
-  return html.trim() ? preserveObsidianWikiLinks(turndown.turndown(html)).trim() : "";
+  if (!html.trim()) return "";
+  return linkObsidianWikiLinks(preserveObsidianWikiLinks(turndown.turndown(html))).trim();
 }
 
 export interface ChatGptMarkdownSegment {
@@ -73,7 +159,15 @@ interface CommittedChatGptMarkdownSegment {
 }
 
 export class ChatGptMarkdownConsistencyError extends Error {
-  constructor(message: string) {
+  constructor(message: string, readonly diagnostic?: {
+    reason: "text_changed" | "block_order_changed" | "source_range_overlap";
+    observedStart?: number;
+    observedEnd?: number;
+    committedStart?: number;
+    committedEnd?: number;
+    observedTextChars: number;
+    committedTextChars: number;
+  }) {
     super(message);
     this.name = "ChatGptMarkdownConsistencyError";
   }
@@ -181,10 +275,10 @@ export class ChatGptMarkdownBuffer {
     if (this.committed.length === 0 || segments.length === 0) return segments;
 
     const pending: ChatGptMarkdownSegment[] = [];
-    const lastCommittedEnd = this.committed
-      .map(segment => segment.sourceEnd)
-      .filter((end): end is number => end !== undefined)
+    const lastRangedCommitted = this.committed
+      .filter(segment => segment.sourceEnd !== undefined)
       .at(-1);
+    const lastCommittedEnd = lastRangedCommitted?.sourceEnd;
     let highestCommittedIndex = -1;
     let sawPending = false;
     let previousSourceStart: number | undefined;
@@ -202,14 +296,20 @@ export class ChatGptMarkdownBuffer {
       if (committedIndex !== undefined) {
         const committed = this.committed[committedIndex]!;
         if (sawPending || committedIndex < highestCommittedIndex || committed.text !== segment.text) {
-          return this.changedCommittedBlockError();
+          return this.changedCommittedBlockError(
+            sawPending || committedIndex < highestCommittedIndex ? "block_order_changed" : "text_changed",
+            segment,
+            committed,
+          );
         }
         highestCommittedIndex = committedIndex;
         continue;
       }
 
       if (segment.sourceStart !== undefined && lastCommittedEnd !== undefined) {
-        if (segment.sourceStart <= lastCommittedEnd) return this.changedCommittedBlockError();
+        if (segment.sourceStart <= lastCommittedEnd) {
+          return this.changedCommittedBlockError("source_range_overlap", segment, lastRangedCommitted!);
+        }
         sawPending = true;
         pending.push(segment);
         continue;
@@ -274,9 +374,22 @@ export class ChatGptMarkdownBuffer {
     };
   }
 
-  private changedCommittedBlockError(): ChatGptMarkdownConsistencyError {
+  private changedCommittedBlockError(
+    reason: NonNullable<ChatGptMarkdownConsistencyError["diagnostic"]>["reason"],
+    observed: ChatGptMarkdownSegment,
+    committed: CommittedChatGptMarkdownSegment,
+  ): ChatGptMarkdownConsistencyError {
     return new ChatGptMarkdownConsistencyError(
       "ChatGPT changed a completed text block that was already streamed to Codex",
+      {
+        reason,
+        observedStart: observed.sourceStart,
+        observedEnd: observed.sourceEnd,
+        committedStart: committed.sourceStart,
+        committedEnd: committed.sourceEnd,
+        observedTextChars: observed.text.length,
+        committedTextChars: committed.text.length,
+      },
     );
   }
 

@@ -7,6 +7,7 @@ Codex app / CLI
 launcher-owned codex-chatgpt-web daemon
   ├─ official /models passthrough + fixed ChatGPT Web models
   ├─ native Responses passthrough or ChatGPT Responses/SSE bridge
+  ├─ authenticated native Search and Image Gen request forwarding
   ├─ ChatGPT browser worker (up to five task-bound Electron tabs)
   ├─ capability broker (full mode only)
   └─ stdio MCP server
@@ -34,6 +35,10 @@ launcher-owned codex-chatgpt-web daemon
 - ChatGPT uses a custom MCP connector backed by `openai/tunnel-client`.
 - Every connector call presents one outer Codex turn capability; the MCP server keeps the derived
   binding private and dispatches the requested action immediately.
+- When Codex exposes tools behind its code-mode `exec` gateway, the connector discovers their
+  runtime registry and can invoke an exact listed name through bridge-owned code. Full mode also
+  preserves Codex's native freeform `exec`; its tool registry enforces the same bounded
+  `wait_agent` contract as direct and structured calls.
 - Tool calls and results remain in the same ChatGPT response while Codex executes them locally.
 
 ### Repository DEV driver
@@ -87,6 +92,12 @@ partition and keep independent documents and lifecycles. Closing a running tab d
 and terminates that browser turn. A sixth concurrent turn fails explicitly; the cap avoids excessive
 parallel traffic that could trigger account abuse controls.
 
+Browser submission and response binding use ChatGPT's logical `data-turn-id`, not the
+`conversation-turn-N` display index, which can change during rendering. The submission baseline
+includes the persistent `data-turn-id-container` wrappers of virtualized history. Remounting old
+messages therefore cannot count as a new submission or another user's turn. Missing or duplicate
+logical identities fail explicitly; accepted messages are never resent to repair their DOM.
+
 Sign-in uses that same persistent Electron partition. ChatGPT login pages and allowed identity-
 provider popups are adopted into a temporary `WebContentsView` inside the launcher instead of being
 redirected to another browser. After the provider returns to ChatGPT, the launcher requires both a
@@ -99,6 +110,20 @@ out of the JSON and are attached natively with stable references. The runtime do
 context JSONL file, upload a synthetic context document, include prompt hashes, or silently truncate
 the envelope. Attachment acceptance and send readiness are verified before the turn begins.
 
+Initial Launcher setup asks which interaction mode to install and defaults to With Automation. The
+same choice remains available in Settings; changing it uses the transactional setup path, replaces
+the installed catalog, and requires a Codex restart. Zero Risk never reads or mutates the ChatGPT DOM.
+For a new ChatGPT chat the adapter provides the complete compiled prompt; for an exactly retained
+chat it also provides an incremental prompt containing only the Codex suffix after the last assistant
+reply. The Launcher chooses between those two prompts from its own retained-tab ownership and writes
+the selected text to the system clipboard. The user has thirty seconds to paste, select the visible
+ChatGPT model, effort, and Zero Risk connector, send, and confirm Sent; a manual compaction handoff
+allows two minutes. Sent ends that confirmation deadline. Waiting for the first MCP bind is part of
+the live turn, which remains subject to explicit cancellation and runtime-owner cleanup.
+The pasted task carries one opaque `request_id` for routing concurrent requests. Start/completion
+sequencing lives in the Zero Risk MCP server metadata, not in user-authored imperative text; the
+per-tab nonce used to validate the Launcher confirmation never leaves the local runtime.
+
 The appended models advertise the authenticated account's context window and a ten-percent
 auto-compaction reserve. Usage is counted with the GPT-5 tokenizer plus fixed platform/image
 reserves, rather than inferred from character length. The ChatGPT composer also has an independent
@@ -108,10 +133,22 @@ Top-level `model_context_window` raises only the proxied native rows' advertised
 Codex to apply its own configured context override without clamping. Routed ChatGPT Web models
 retain their measured adapter-owned limits.
 
+Bigger Context partitions complete ordered records against each message's available token and
+composer budgets. Inert stages carry text; the final message also carries all retained attachments,
+the execution contract and any output schema. Their reserves are deducted before partitioning,
+then preflight checks the actual compiled messages and total transaction. The selected execution
+effort, attachment references and three-part maximum remain unchanged.
+
 In Full mode, routed compaction v1/v2 uses the exact retained source agent and a one-shot MCP control
 capability that accepts only the bound checkpoint; it cannot claim or invoke the ordinary Codex tool
-environment. A missing retained source falls back to a dedicated read-only Temporary Chat built from
-canonical Codex history; an invalid or ambiguous handoff still fails explicitly. Browser-only mode
+environment. Zero Risk always advertises a fixed three-times compaction interval without enabling
+Bigger Context multipart transport. At that boundary its active ChatGPT response receives the
+checkpoint instruction as an MCP result, returns the compacted context through its bound completion
+control, and ends. The old manual chat is retired; the next compacted Codex request owns a fresh
+Temporary Chat and its locally compiled prompt is copied to the clipboard. A missing Automatic
+retained source falls back to a dedicated read-only Temporary Chat built from canonical Codex
+history; a missing Zero Risk source uses the same explicit manual checkpoint contract. An invalid or
+ambiguous handoff still fails explicitly. Browser-only mode
 uses the same read-only summarization path, then returns the native replacement-history shape expected
 by Codex. A prompt-level checkpoint marker is translated into a visible Codex trace item;
 every later tool action in the same turn continues to present the current turn capability. Visible
@@ -127,10 +164,12 @@ sign-in and model turns both remain in Electron. Full mode separately downloads 
 `openai/tunnel-client` build for the current OS/architecture and verifies it against the release
 SHA-256 manifest.
 
-On first launch, the embedded runtime is identity-checked and copied atomically into a private
-versioned directory under the application home. Daemon and MCP commands use that durable copy,
-which is required because Linux AppImage mount paths are temporary and must never be persisted in
-Codex or tunnel configuration.
+On first launch, the embedded runtime is checked against a deterministic manifest covering every
+file path, size, and SHA-256 before any launcher port or window opens. The source, transactional
+temporary copy, and final destination are all validated before the private versioned directory is
+accepted under the application home. Daemon and MCP commands use that durable copy, which is
+required because Linux AppImage mount paths are temporary and must never be persisted in Codex or
+tunnel configuration.
 
 The launcher is the sole process supervisor on macOS, Windows, and Linux. It starts the optional
 tunnel first, waits for healthy/ready evidence, starts the Responses daemon, and then waits for its
@@ -140,9 +179,12 @@ launcher runtime from a stale or external process. Legacy macOS launchd services
 removed during an explicit launcher migration; launchd remains only for the advanced terminal-only
 mode.
 
-Setup keeps Codex's built-in `openai` provider; its only managed provider-routing assignment is
-`openai_base_url`. The daemon
-forwards the authenticated official model catalog and appends only the routed models owned by the
+Setup keeps Codex's built-in `openai` provider. It routes Responses through the local daemon with
+`openai_base_url`, while pinning `experimental_realtime_webrtc_call_base_url` to Codex's official
+ChatGPT endpoint so Voice session creation never falls through to the Responses-only bridge. Both
+assignments are journaled and restored exactly on disconnect or uninstall; a conflicting existing
+Voice route requires explicit `--replace-codex-route` ownership. The daemon forwards the
+authenticated official model catalog and appends only the routed models owned by the
 `chatgpt-web/` namespace; no static catalog is installed. Subagent protocol selection is explicit,
 and new installations default to Compatibility V1 because it is the only surface portable across
 native and routed Web backends:
@@ -173,7 +215,7 @@ Setup never restarts an already loaded daemon implicitly. A requested stop, rest
 or uninstall first calls a private authenticated drain endpoint. The daemon rejects new turns and
 reports two independent counters:
 
-- active Responses HTTP requests, including native compaction passthrough;
+- active HTTP requests, including native compaction, Search, and Image Gen forwarding;
 - active ChatGPT browser sessions, including time spent waiting for local Codex tool results.
 
 The lifecycle operation proceeds only when both counters are zero. The launcher then stops the

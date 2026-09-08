@@ -3,6 +3,7 @@ export interface ChatGptWebAdapterErrorOptions {
   errorType: string;
   code: string;
   retryable: boolean;
+  cause?: unknown;
 }
 
 export class ChatGptWebAdapterError extends Error {
@@ -12,12 +13,20 @@ export class ChatGptWebAdapterError extends Error {
   readonly retryable: boolean;
 
   constructor(message: string, options: ChatGptWebAdapterErrorOptions) {
-    super(message);
+    super(message, options.cause === undefined ? undefined : { cause: options.cause });
     this.name = "ChatGptWebAdapterError";
     this.status = options.status;
     this.errorType = options.errorType;
     this.code = options.code;
     this.retryable = options.retryable;
+  }
+}
+
+// Only the compaction owner may signal this after the broker accepts its one-shot handoff.
+// It cancels browser observation, while the accepted summary remains the native result.
+export class ChatGptCompactionHandoffAccepted extends DOMException {
+  constructor() {
+    super("Structured compaction handoff accepted", "AbortError");
   }
 }
 
@@ -30,6 +39,13 @@ export function chatGptBrowserTabClosedError(): ChatGptWebAdapterError {
       code: "client_cancelled",
       retryable: false,
     },
+  );
+}
+
+export function chatGptTurnSupersededError(): ChatGptWebAdapterError {
+  return new ChatGptWebAdapterError(
+    "A newer Codex instruction superseded this ChatGPT response.",
+    { status: 499, errorType: "client_closed_request", code: "client_cancelled", retryable: false },
   );
 }
 

@@ -55,9 +55,10 @@ test("Full-mode Pro prompts pass one stable turn token directly to native action
   expect(transportOnly).toContain("After a deterministic tool failure, update the working hypothesis from that result");
   expect(transportOnly).toContain("do not repeat the same call unless its inputs or observable state changed.");
   expect(transportOnly).toContain("Continue using the available tools until the requested work is complete and verified.");
+  expect(transportOnly).toContain("Write the user-facing final answer only after the last required tool result has settled.");
   expect(transportOnly).toContain(`The task context is complete. Pass turn_token ${token} unchanged to every Codex Native call in this response, including continuations after tool results; do not expose it in the answer. Execute the latest active user request now.`);
   expect(transportOnly).not.toMatch(/codex_bind_turn|binding_id|outer_tool_gateway|command_tool/);
-  expect(transportOnly).not.toMatch(/codex_exec|codex_write_stdin|codex_apply_patch|codex_view_image|codex_tool_inventory|codex_tool_call/);
+  expect(transportOnly).not.toMatch(/codex_exec|codex_write_stdin|codex_apply_patch|codex_view_image|codex_tool_inventory|codex\.control\.turn_complete/);
   expect(transportOnly).not.toMatch(/expired|invalid|revoked|blocked|safety|security layer|permission gate/i);
   expect(compiled.text).not.toContain("CODEX_INTERNAL_CONTEXT_COMPACT");
   expect(compiled.text).not.toContain("internally compacts this response");
@@ -184,8 +185,10 @@ test("Bigger Context uses the minimum transport and reserves three stages for co
 test("browser-only Medium directs users to the full harness", () => {
   const capabilities = { localToolsEnabled: false, solAvailable: true, proAvailable: true };
   const warning = chatGptReadOnlyContextWarning(request("medium"), capabilities);
-  expect(warning).toContain("Browser-only mode");
-  expect(warning).toContain("Full harness");
+  expect(warning).toStartWith("> **Local tools unavailable**");
+  expect(warning).toContain("`MCP`");
+  expect(warning).toContain("`Codex Web GPT`");
+  expect(warning).toContain("`Full`");
   expect(warning).toContain("selected ChatGPT Web model");
   expect(warning).not.toContain("tool-capable ChatGPT Web model first");
   expect(chatGptReadOnlyContextWarning(request("medium"), {
@@ -279,6 +282,31 @@ test("Bigger Context compaction preserves history above the retired inline byte 
   for (let index = 1; index <= 6; index += 1) {
     expect(staged).toContain(`multipart-history-${index}-`);
   }
+});
+
+test("Bigger Context minimizes the largest ordered stage instead of overfilling a middle part", () => {
+  const compact = request("high");
+  compact._compactionRequest = true;
+  compact.context.systemPrompt = ["system".repeat(1_000)];
+  compact.context.messages = [
+    ...Array.from({ length: 3 }, (_unused, index) => ({
+      role: "user" as const,
+      content: `history-${index}-${"x".repeat(100_000)}`,
+      timestamp: index + 1,
+    })),
+    { role: "user", content: "compact now", timestamp: 4 },
+  ];
+
+  const multipart = compileChatGptWebPrompt(
+    compact,
+    { localToolsEnabled: false, solAvailable: true, proAvailable: false },
+    undefined,
+    { experimentalMultipartParts: CHATGPT_BIGGER_CONTEXT_PARTS },
+  );
+  const parts = multipart.multipart!.parts.map(part => JSON.parse(part) as { records: unknown[] });
+
+  expect(parts.map(part => part.records.length)).toEqual([2, 1, 2]);
+  expect(Math.max(...multipart.multipart!.parts.map(part => part.length))).toBeLessThan(120_000);
 });
 
 test("Web compaction rebuilds attachments after trimming an oversized oldest image message", () => {

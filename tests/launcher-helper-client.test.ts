@@ -1,47 +1,36 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
+import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
 import { LauncherBrowserHelperClient } from "../src/adapters/chatgpt-web/launcher-helper-client";
 import type { BrowserTurn, ResolvedBrowserConfig } from "../src/adapters/chatgpt-web/browser-worker";
-import { LAUNCHER_BROWSER_HOST_KIND } from "../src/launcher-browser-host";
+import { LAUNCHER_BROWSER_HOST_KIND, LAUNCHER_BROWSER_IDLE_URL } from "../src/launcher-browser-host";
 
 const roots: string[] = [];
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-test("Bun daemon streams a prepared browser turn through the persistent Node helper", async () => {
+test("daemon streams browser lifecycle through the real helper process", async () => {
   const root = mkdtempSync(join(tmpdir(), "codex-launcher-helper-client-"));
   roots.push(root);
-  const helper = join(root, "helper.cjs");
+  const helper = join(root, "helper.ts");
   writeFileSync(helper, `
-    const readline = require("node:readline").createInterface({ input: process.stdin });
-    const send = value => process.stdout.write(JSON.stringify(value) + "\\n");
-    let active;
-    send({ type: "ready" });
-    readline.on("line", line => {
-      const message = JSON.parse(line);
-      if (message.type === "shutdown") process.exit(0);
-      if (message.type === "run") {
-        active = message;
-        send({ type: "event", id: message.id, event: "prepared_selected", reused: false });
-        return;
-      }
-      if (message.type === "prepared_selected_ack") {
-        send({ type: "event", id: message.id, event: "send_activated" });
-        return;
-      }
-      if (message.type !== "send_activation_ack") return;
-      send({ type: "event", id: message.id, event: "submitted" });
-      send({ type: "event", id: message.id, event: "reasoning", text: "Reading project" });
-      send({ type: "event", id: message.id, event: "reasoning", text: " files", continuation: true });
-      send({ type: "event", id: message.id, event: "text", text: "done" });
-      if (active.turn.captureLunaCheckpoint) send({
-        type: "event",
-        id: message.id,
-        event: "luna_checkpoint",
+    import { ChatGptBrowserWorker } from ${JSON.stringify(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url).href)};
+    // Substitute only the browser. Both sides of the production IPC protocol run unchanged.
+    ChatGptBrowserWorker.prototype.run = async turn => {
+      await turn.onPreparedSelected(false);
+      const prepared = await turn.prepare();
+      if (prepared.multipart.parts.length !== 3) throw new Error("Multipart context was lost");
+      await turn.onMultipartStageAcknowledged?.(1);
+      await turn.onMultipartStageAcknowledged?.(2);
+      await turn.onSendActivated();
+      turn.onSubmitted();
+      turn.onReasoningSummary("Reading project");
+      turn.onReasoningSummary(" files", true);
+      turn.onTextDelta("done");
+      if (turn.captureLunaCheckpoint) turn.onLunaCheckpoint({
         answerHash: "a".repeat(64),
         checkpoint: {
           version: 1,
@@ -52,8 +41,9 @@ test("Bun daemon streams a prepared browser turn through the persistent Node hel
           pending: [],
         },
       });
-      send({ type: "result", id: message.id, text: "done" });
-    });
+      return "done";
+    };
+    await import(${JSON.stringify(new URL("../src/adapters/chatgpt-web/browser-helper-main.ts", import.meta.url).href)});
   `, { mode: 0o700 });
   const descriptorHelper = join(root, "descriptor-helper.cjs");
   writeFileSync(descriptorHelper, "process.exit(99);\n", { mode: 0o700 });
@@ -70,12 +60,12 @@ test("Bun daemon streams a prepared browser turn through the persistent Node hel
     },
     helper: { executable: process.execPath, script: descriptorHelper },
     partition: "persist:codex-web-gpt-chatgpt",
-    idleUrl: "about:blank#codex-web-gpt-browser-host",
+    idleUrl: LAUNCHER_BROWSER_IDLE_URL,
     surfaceId: "launcher_surface_id_0123456789AB",
     createdAt: new Date().toISOString(),
   })}\n`, { mode: 0o600 });
   const config: ResolvedBrowserConfig = {
-    appName: "Codex Native",
+    appName: "Codex Native2",
     browserHost: "launcher",
     browserHostDescriptorPath: descriptorPath,
     browserHelperScriptPath: helper,
@@ -88,6 +78,7 @@ test("Bun daemon streams a prepared browser turn through the persistent Node hel
   const reasoning: Array<{ text: string; continuation: boolean }> = [];
   const deltas: string[] = [];
   const checkpoints: unknown[] = [];
+  const acknowledgedStages: number[] = [];
   let sendActivated = false;
   let submitted = false;
   let released = false;
@@ -98,7 +89,12 @@ test("Bun daemon streams a prepared browser turn through the persistent Node hel
       modelId: "gpt-5.6-sol",
       reasoning: "high",
       capabilities: { localToolsEnabled: false, solAvailable: true, proAvailable: false },
-      prepare: async () => ({ text: "inspect", images: [], release: () => { released = true; } }),
+      prepare: async () => ({
+        text: "inspect", images: [],
+        multipart: { parts: ["part one", "part two", "part three"], commit: "inspect" },
+        release: () => { released = true; },
+      }),
+      onMultipartStageAcknowledged: stage => { acknowledgedStages.push(stage); },
       onSendActivated: () => { sendActivated = true; },
       onSubmitted: () => { submitted = true; },
       onReasoningSummary: (text, continuation) => reasoning.push({ text, continuation: continuation === true }),
@@ -114,6 +110,7 @@ test("Bun daemon streams a prepared browser turn through the persistent Node hel
     expect(deltas).toEqual(["done"]);
     expect(sendActivated).toBe(true);
     expect(submitted).toBe(true);
+    expect(acknowledgedStages).toEqual([1, 2]);
     expect(checkpoints).toEqual([{
       answerHash: "a".repeat(64),
       checkpoint: {
@@ -128,6 +125,97 @@ test("Bun daemon streams a prepared browser turn through the persistent Node hel
     expect(released).toBe(true);
   } finally {
     await client.close();
+  }
+});
+
+test("accepted compaction retires through the helper as completed without hiding cancellations or errors", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-helper-compaction-end-"));
+  roots.push(root);
+  const helper = join(root, "helper.ts");
+  writeFileSync(helper, `
+    import { ChatGptBrowserWorker } from ${JSON.stringify(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url).href)};
+    const run = ChatGptBrowserWorker.prototype.run;
+    ChatGptBrowserWorker.prototype.run = function(turn) {
+      // Substitute the browser wait only. Actual worker catch/finally, IPC and launcher end run.
+      this.runStage = async () => {
+        const stopped = new Promise((resolve, reject) => {
+          turn.abortSignal.addEventListener("abort", () => reject(
+            turn.traceId === "compaction_real_failure"
+              ? new Error("independent browser failure")
+              : new DOMException("ChatGPT web turn aborted", "AbortError")
+          ), { once: true });
+        });
+        turn.onSubmitted();
+        return stopped;
+      };
+      return run.call(this, turn);
+    };
+    await import(${JSON.stringify(new URL("../src/adapters/chatgpt-web/browser-helper-main.ts", import.meta.url).href)});
+  `, { mode: 0o700 });
+  const ended = new Map<string, Record<string, unknown>>();
+  const server = Bun.serve({
+    hostname: "127.0.0.1", port: 0,
+    async fetch(request) {
+      const body = await request.json() as Record<string, unknown>;
+      if (body.phase === "start") return Response.json({
+        ok: true, surfaceId: "launcher_surface_id_0123456789AB", reused: true, connectorBound: true,
+      });
+      if (body.phase === "end") ended.set(body.traceId as string, body);
+      return Response.json({ ok: true, cancelledByUser: false });
+    },
+  });
+  const descriptorPath = join(root, "launcher.json");
+  writeFileSync(descriptorPath, JSON.stringify({
+    version: 2, kind: LAUNCHER_BROWSER_HOST_KIND, profile: "production", pid: process.pid,
+    endpoint: `http://127.0.0.1:${server.port}`,
+    control: { endpoint: `http://127.0.0.1:${server.port}`, token: "launcher-control-token-0123456789abcdefghijklmnop" },
+    helper: { executable: process.execPath, script: helper },
+    partition: "persist:codex-web-gpt-chatgpt", idleUrl: LAUNCHER_BROWSER_IDLE_URL,
+    surfaceId: "launcher_surface_id_0123456789AB", createdAt: new Date().toISOString(),
+  }), { mode: 0o600 });
+  const client = new LauncherBrowserHelperClient({
+    appName: "Codex Native2", browserHost: "launcher", browserHostDescriptorPath: descriptorPath,
+    browserHelperScriptPath: helper, browserDiagnosticsPath: join(root, "diagnostics"),
+    storageStatePath: join(root, "unused-state.json"), chromeExecutablePath: join(root, "unused-chrome"),
+    turnTimeoutMs: 60_000, headed: true, autoApproveToolCalls: false,
+  });
+  const logs: string[] = [];
+  const logger = spyOn(console, "info").mockImplementation((...args) => { logs.push(args.join(" ")); });
+  try {
+    for (const [traceId, reason, status] of [
+      ["compaction_accepted", new ChatGptCompactionHandoffAccepted(), "completed"],
+      ["compaction_cancelled", new DOMException("user cancelled", "AbortError"), "aborted"],
+      ["compaction_same_text", new DOMException("Structured compaction handoff accepted", "AbortError"), "aborted"],
+      ["compaction_deadline", new Error("compaction deadline exceeded"), "aborted"],
+      ["compaction_real_failure", new ChatGptCompactionHandoffAccepted(), "failed"],
+    ] as const) {
+      const controller = new AbortController();
+      let released = false;
+      const prepare = async () => ({ text: "checkpoint instruction", images: [], release: () => { released = true; } });
+      await expect(client.run({
+        traceId, modelId: "gpt-5.6-sol", reasoning: "high",
+        capabilities: { localToolsEnabled: false, solAvailable: true, proAvailable: false },
+        nativeConnector: true, conversationKey: "a".repeat(64), requireRetainedConversation: true,
+        prepare, prepareResume: prepare, abortSignal: controller.signal,
+        onSubmitted: () => { controller.abort(reason); }, onTextDelta() {},
+      })).rejects.toThrow(traceId === "compaction_real_failure"
+        ? "independent browser failure"
+        : traceId === "compaction_accepted" ? "Structured compaction handoff accepted" : "ChatGPT web turn aborted");
+      // Logical outcome is observed only after the real helper's launcher retirement handshake.
+      expect(ended.get(traceId)?.status).toBe(status);
+      expect(ended.get(traceId)?.retain).toBeUndefined();
+      expect(released).toBeTrue();
+    }
+    await client.close();
+    expect(logs.some(line => line.includes("compaction_accepted ended after accepted structured compaction handoff"))).toBeTrue();
+    expect(logs.some(line => line.includes("compaction_accepted failed:"))).toBeFalse();
+    for (const traceId of ["compaction_cancelled", "compaction_same_text", "compaction_deadline", "compaction_real_failure"]) {
+      expect(logs.some(line => line.includes(`${traceId} failed:`))).toBeTrue();
+    }
+  } finally {
+    await client.close();
+    logger.mockRestore();
+    await server.stop(true);
   }
 });
 

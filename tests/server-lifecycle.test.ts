@@ -1,13 +1,15 @@
 import { expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
+import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { chatGptWebTraceId } from "../src/adapters/chatgpt-web";
+import { runStructuredCompactionOnce } from "../src/adapters/chatgpt-web/compaction-handoff";
 import { ChatGptTextFeed, ChatGptTraceFeed, chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
 import { callTurnBroker, closeTurnBrokers, RemoteTurnBroker, TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
 import { defaultBrokerEndpoint, defaultConfig, providerConfig } from "../src/config";
 import { parseRequest } from "../src/responses/parser";
-import { HttpTurnCounter, responseRequest, routeChatGptWebRequest, startServer } from "../src/server";
+import { compactRequest, HttpTurnCounter, responseRequest, routeChatGptWebRequest, startServer } from "../src/server";
 
 test("DEV harness configuration cannot bind a Responses listener", () => {
   const config = { ...defaultConfig("browser-only"), purpose: "dev-harness" as const, port: 0 };
@@ -206,6 +208,69 @@ test("HTTP turn tracking releases a stream requested by an already disconnected 
   expect(response.body).toBeNull();
 });
 
+test("a real HTTP peer disconnect releases a streaming turn", async () => {
+  const config = { ...defaultConfig("browser-only"), port: 0 };
+  let source!: ReadableStreamDefaultController<Uint8Array>;
+  let sourceCancelled = false;
+  let markSourceReady!: () => void;
+  const sourceReady = new Promise<void>(resolve => { markSourceReady = resolve; });
+  const server = startServer(config, {
+    fetchUpstream: async () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        source = controller;
+        markSourceReady();
+      },
+      cancel() {
+        sourceCancelled = true;
+      },
+    })),
+  });
+  const port = server.port;
+  if (port === undefined) throw new Error("test server did not bind a TCP port");
+  const endpoint = `http://127.0.0.1:${port}`;
+  const socket = createConnection({ host: "127.0.0.1", port });
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      socket.once("connect", resolve);
+      socket.once("error", reject);
+    });
+    const body = JSON.stringify({ query: "disconnect lifecycle proof" });
+    socket.write([
+      "POST /v1/alpha/search HTTP/1.1",
+      "Host: 127.0.0.1",
+      "Authorization: Bearer test-codex-session",
+      "Content-Type: application/json",
+      `Content-Length: ${Buffer.byteLength(body)}`,
+      "Connection: keep-alive",
+      "",
+      body,
+    ].join("\r\n"));
+    await sourceReady;
+    source.enqueue(new TextEncoder().encode("stream-open"));
+    await new Promise<void>((resolve, reject) => {
+      socket.once("data", () => resolve());
+      socket.once("error", reject);
+    });
+
+    expect(await (await fetch(`${endpoint}/healthz`)).json()).toMatchObject({ active_http_turns: 1 });
+    socket.destroy();
+
+    const deadline = Date.now() + 1_000;
+    let activeHttpTurns = 1;
+    while (Date.now() < deadline && activeHttpTurns !== 0) {
+      const health = await (await fetch(`${endpoint}/healthz`)).json() as { active_http_turns: number };
+      activeHttpTurns = health.active_http_turns;
+      if (activeHttpTurns !== 0) await Bun.sleep(10);
+    }
+    expect(activeHttpTurns).toBe(0);
+    expect(sourceCancelled).toBe(true);
+  } finally {
+    socket.destroy();
+    await server.stop(true);
+  }
+});
+
 test("HTTP turn cancellation aborts the tracked request and waits for lifecycle release", async () => {
   const turns = new HttpTurnCounter();
   let observedAbort = false;
@@ -221,6 +286,390 @@ test("HTTP turn cancellation aborts the tracked request and waits for lifecycle 
   await expect(tracked).rejects.toBe("launcher quit");
   expect(observedAbort).toBe(true);
   expect(turns.count()).toBe(0);
+});
+
+test("native Codex interrupt cancels only HTTP streams owned by the exact thread and turn", async () => {
+  const turns = new HttpTurnCounter();
+  const started: Promise<Response>[] = [];
+  const aborted: string[] = [];
+  for (const identity of [
+    { threadId: "thread_exact", turnId: "turn_exact" },
+    { threadId: "thread_other", turnId: "turn_other" },
+  ]) {
+    started.push(turns.track((signal, bindIdentity) => {
+      bindIdentity(identity);
+      return new Promise<Response>((_resolve, reject) => {
+        signal.addEventListener("abort", () => {
+          aborted.push(identity.turnId);
+          reject(signal.reason);
+        }, { once: true });
+      });
+    }));
+  }
+  await waitForTurnCount(turns, 2);
+
+  expect(await turns.cancelTurn({ threadId: "thread_exact", turnId: "turn_exact" })).toBe(1);
+  expect(aborted).toEqual(["turn_exact"]);
+  expect(turns.count()).toBe(1);
+  await expect(started[0]!).rejects.toHaveProperty("name", "AbortError");
+
+  expect(await turns.cancelAll()).toBe(1);
+  await expect(started[1]!).rejects.toThrow("Active HTTP turns cancelled");
+});
+
+test("native Codex interrupt remains authoritative when it arrives before HTTP identity binding", async () => {
+  const turns = new HttpTurnCounter();
+  const identity = { threadId: "thread_interrupt_race", turnId: "turn_interrupt_race" };
+  let bind!: () => void;
+  const mayBind = new Promise<void>(resolve => { bind = resolve; });
+  let observedAbort = false;
+  const response = turns.track(async (signal, bindIdentity) => {
+    await mayBind;
+    bindIdentity(identity);
+    observedAbort = signal.aborted;
+    return new Response(new ReadableStream<Uint8Array>());
+  });
+  await waitForTurnCount(turns, 1);
+
+  expect(await turns.cancelTurn(identity)).toBe(0);
+  bind();
+  expect((await response).status).toBe(499);
+  expect(observedAbort).toBeTrue();
+  await waitForTurnCount(turns, 0);
+});
+
+test("native passthrough response and compaction requests expose their exact interrupt identity", async () => {
+  const config = defaultConfig("browser-only");
+  const responseIdentity = { threadId: "thread_native_response", turnId: "turn_native_response" };
+  let boundResponseIdentity: typeof responseIdentity | undefined;
+  const response = await responseRequest(new Request("http://127.0.0.1/v1/responses", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-5.6-sol",
+      client_metadata: {
+        "x-codex-turn-metadata": JSON.stringify({
+          thread_id: responseIdentity.threadId,
+          turn_id: responseIdentity.turnId,
+        }),
+      },
+      input: [],
+    }),
+  }), config, undefined, {
+    onTurnIdentity: identity => { boundResponseIdentity = identity; },
+  });
+  expect(boundResponseIdentity).toEqual(responseIdentity);
+  expect(response.status).toBe(502);
+
+  const compactIdentity = { threadId: "thread_native_compact", turnId: "turn_native_compact" };
+  let boundCompactIdentity: typeof compactIdentity | undefined;
+  const compact = await compactRequest(new Request("http://127.0.0.1/v1/responses/compact", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-codex-turn-metadata": JSON.stringify({
+        thread_id: compactIdentity.threadId,
+        turn_id: compactIdentity.turnId,
+      }),
+    },
+    body: JSON.stringify({ model: "gpt-5.6-sol", input: [] }),
+  }), config, undefined, {
+    onTurnIdentity: identity => { boundCompactIdentity = identity; },
+  });
+  expect(boundCompactIdentity).toEqual(compactIdentity);
+  expect(compact.status).toBe(502);
+});
+
+test("authenticated Interrupt hook endpoint releases the exact routed Web turn", async () => {
+  const config = { ...defaultConfig("browser-only"), port: 0 };
+  const threadId = "thread_interrupt_hook";
+  const turnId = "turn_interrupt_hook";
+  let adapterAborted = false;
+  let browserAborted = false;
+  let rejectBrowser!: (error: Error) => void;
+  const browser = new Promise<string>((_resolve, reject) => { rejectBrowser = reject; });
+  chatGptTurnSessions.clear();
+  chatGptTurnSessions.getOrCreate("interrupt-hook-browser", () => ({
+    mode: "read-only",
+    browser,
+    physicalSettlement: browser.then(() => undefined, () => undefined),
+    trace: new ChatGptTraceFeed(),
+    text: new ChatGptTextFeed(),
+    cancel: reason => {
+      browserAborted = true;
+      rejectBrowser(reason ?? new Error("native turn interrupted"));
+    },
+  }), "interrupt-hook-trace", "interrupt-hook-owner", turnId, threadId);
+  const server = startServer(config, {
+    adapterFactory: () => ({
+      name: "interrupt-test",
+      runTurn: (_parsed, incoming) => new Promise<void>((_resolve, reject) => {
+        incoming.abortSignal!.addEventListener("abort", () => {
+          adapterAborted = true;
+          reject(incoming.abortSignal!.reason);
+        }, { once: true });
+      }),
+    }),
+  });
+  const endpoint = `http://127.0.0.1:${server.port}`;
+  const response = fetch(`${endpoint}/v1/responses`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "chatgpt-web/high",
+      stream: true,
+      client_metadata: {
+        "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: turnId }),
+      },
+      input: [{
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "wait until interrupted" }],
+        internal_chat_message_metadata_passthrough: { turn_id: turnId },
+      }],
+    }),
+  });
+
+  try {
+    const deadline = Date.now() + 1_000;
+    let activeHttpTurns = 0;
+    while (Date.now() < deadline && activeHttpTurns !== 1) {
+      activeHttpTurns = (await (await fetch(`${endpoint}/healthz`)).json() as { active_http_turns: number }).active_http_turns;
+      if (activeHttpTurns !== 1) await Bun.sleep(5);
+    }
+    expect(activeHttpTurns).toBe(1);
+
+    const interrupted = await fetch(`${endpoint}/admin/interrupt-turn`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${config.controlToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ threadId, turnId }),
+    });
+    expect(interrupted.status).toBe(200);
+    expect(await interrupted.json()).toMatchObject({
+      status: "ok",
+      cancelled_http_turns: 1,
+      cancelled_browser_turns: 1,
+    });
+    expect(adapterAborted).toBeTrue();
+    expect(browserAborted).toBeTrue();
+    await response;
+  } finally {
+    chatGptTurnSessions.clear();
+    await server.stop(true);
+  }
+});
+
+test("authenticated Interrupt hook endpoint also releases the exact native compaction request", async () => {
+  const config = { ...defaultConfig("browser-only"), port: 0 };
+  const threadId = "thread_interrupt_compact";
+  const turnId = "turn_interrupt_compact";
+  let adapterAborted = false;
+  const server = startServer(config, {
+    adapterFactory: () => ({
+      name: "interrupt-compact-test",
+      runTurn: (_parsed, incoming) => new Promise<void>((_resolve, reject) => {
+        incoming.abortSignal!.addEventListener("abort", () => {
+          adapterAborted = true;
+          reject(incoming.abortSignal!.reason);
+        }, { once: true });
+      }),
+    }),
+  });
+  const endpoint = `http://127.0.0.1:${server.port}`;
+  const compactResponse = fetch(`${endpoint}/v1/responses/compact`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: turnId }),
+    },
+    body: JSON.stringify({
+      model: "chatgpt-web/high",
+      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "compact me" }] }],
+    }),
+  });
+
+  try {
+    const deadline = Date.now() + 1_000;
+    let activeHttpTurns = 0;
+    while (Date.now() < deadline && activeHttpTurns !== 1) {
+      activeHttpTurns = (await (await fetch(`${endpoint}/healthz`)).json() as { active_http_turns: number }).active_http_turns;
+      if (activeHttpTurns !== 1) await Bun.sleep(5);
+    }
+    expect(activeHttpTurns).toBe(1);
+
+    const interrupted = await fetch(`${endpoint}/admin/interrupt-turn`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${config.controlToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ threadId, turnId }),
+    });
+    expect(interrupted.status).toBe(200);
+    expect(await interrupted.json()).toMatchObject({
+      status: "ok",
+      cancelled_http_turns: 1,
+      cancelled_browser_turns: 0,
+    });
+    expect(adapterAborted).toBeTrue();
+    await compactResponse;
+  } finally {
+    await server.stop(true);
+  }
+});
+
+test("Interrupt acknowledges after exact browser cancellation starts without waiting for helper teardown", async () => {
+  const config = { ...defaultConfig("browser-only"), port: 0 };
+  const threadId = "thread_interrupt_slow_cleanup";
+  const turnId = "turn_interrupt_slow_cleanup";
+  let resolvePhysical!: () => void;
+  const physicalSettlement = new Promise<void>(resolve => { resolvePhysical = resolve; });
+  let cancelled = false;
+  let replacementStarted = false;
+  chatGptTurnSessions.clear();
+  chatGptTurnSessions.getOrCreate("slow-cleanup", () => ({
+    mode: "read-only",
+    browser: new Promise<string>(() => {}),
+    physicalSettlement,
+    trace: new ChatGptTraceFeed(),
+    text: new ChatGptTextFeed(),
+    cancel: () => { cancelled = true; },
+  }), "slow-cleanup-trace", "slow-cleanup-owner", turnId, threadId);
+  const server = startServer(config);
+
+  try {
+    const interrupted = await Promise.race([
+      fetch(`http://127.0.0.1:${server.port}/admin/interrupt-turn`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${config.controlToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ threadId, turnId }),
+      }),
+      Bun.sleep(250).then(() => undefined),
+    ]);
+    expect(interrupted).toBeInstanceOf(Response);
+    expect(await interrupted!.json()).toMatchObject({
+      status: "ok",
+      cancelled_browser_turns: 1,
+    });
+    expect(cancelled).toBeTrue();
+
+    const replacement = chatGptTurnSessions.getOrCreateAfterOwnerRetirement(
+      "slow-cleanup-replacement",
+      "slow-cleanup-owner",
+      () => {
+        replacementStarted = true;
+        return {
+          mode: "read-only",
+          browser: Promise.resolve("replacement"),
+          physicalSettlement: Promise.resolve(),
+          trace: new ChatGptTraceFeed(),
+          text: new ChatGptTextFeed(),
+          cancel: () => {},
+        };
+      },
+    );
+    await Bun.sleep(10);
+    expect(replacementStarted).toBeFalse();
+    resolvePhysical();
+    await replacement;
+    expect(replacementStarted).toBeTrue();
+  } finally {
+    resolvePhysical();
+    chatGptTurnSessions.clear();
+    await server.stop(true);
+  }
+});
+
+test("Interrupt retires a logically complete browser turn whose helper is still physically stuck", async () => {
+  const config = { ...defaultConfig("browser-only"), port: 0 };
+  const threadId = "thread_interrupt_logical_complete";
+  const turnId = "turn_interrupt_logical_complete";
+  let resolvePhysical!: () => void;
+  const physicalSettlement = new Promise<void>(resolve => { resolvePhysical = resolve; });
+  let cancelled = false;
+  chatGptTurnSessions.clear();
+  const session = chatGptTurnSessions.getOrCreate("logical-complete", () => ({
+    mode: "read-only",
+    browser: Promise.resolve("complete"),
+    physicalSettlement,
+    trace: new ChatGptTraceFeed(),
+    text: new ChatGptTextFeed(),
+    cancel: () => { cancelled = true; },
+  }), "logical-complete-trace", "logical-complete-owner", turnId, threadId);
+  await session.browserOutcome;
+  expect(session.isActive()).toBeFalse();
+  expect(session.isPhysicallySettled()).toBeFalse();
+  const server = startServer(config);
+
+  try {
+    const interrupted = await fetch(`http://127.0.0.1:${server.port}/admin/interrupt-turn`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${config.controlToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ threadId, turnId }),
+    });
+    expect(await interrupted.json()).toMatchObject({
+      status: "ok",
+      cancelled_browser_turns: 1,
+    });
+    expect(cancelled).toBeTrue();
+    expect(chatGptTurnSessions.find("logical-complete")).toBeUndefined();
+  } finally {
+    resolvePhysical();
+    chatGptTurnSessions.clear();
+    await server.stop(true);
+  }
+});
+
+test("Interrupt cancels a detached structured compaction by exact native turn identity", async () => {
+  const config = { ...defaultConfig("browser-only"), port: 0 };
+  const threadId = "thread_interrupt_structured";
+  const turnId = "turn_interrupt_structured";
+  let aborted = false;
+  const run = runStructuredCompactionOnce(
+    `interrupt-structured-${Date.now()}-${Math.random()}`,
+    {
+      ownerKey: "interrupt-structured-owner",
+      traceIds: ["interrupt-structured-trace"],
+      nativeThreadId: threadId,
+      nativeTurnId: turnId,
+    },
+    signal => new Promise<string>((_resolve, reject) => {
+      signal.addEventListener("abort", () => {
+        aborted = true;
+        reject(signal.reason);
+      }, { once: true });
+    }),
+  );
+  const server = startServer(config);
+
+  try {
+    await Bun.sleep(0);
+    const interrupted = await fetch(`http://127.0.0.1:${server.port}/admin/interrupt-turn`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${config.controlToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ threadId, turnId }),
+    });
+    expect(await interrupted.json()).toMatchObject({
+      status: "ok",
+      cancelled_compaction_runs: 1,
+    });
+    await expect(run).rejects.toThrow("Codex turn interrupted");
+    expect(aborted).toBeTrue();
+  } finally {
+    await server.stop(true);
+  }
 });
 
 test("authenticated lifecycle control cancels orphaned browser turns", async () => {
@@ -325,6 +774,80 @@ test("authenticated targeted cancellation terminates one browser trace without r
     }, "trace_target")).toBe(target);
   } finally {
     chatGptTurnSessions.clear();
+    await server.stop(true);
+  }
+});
+
+test("authenticated targeted cancellation aborts a shared structured compaction owner", async () => {
+  const config = { ...defaultConfig("browser-only"), port: 0 };
+  const server = startServer(config);
+  const handoffTraceId = "a1b2c3d4e5f6";
+  const traceId = `${handoffTraceId}_fallback`;
+  let aborted = false;
+  const run = runStructuredCompactionOnce(
+    `structured-${Date.now()}-${Math.random()}`,
+    { ownerKey: `owner-${traceId}`, traceIds: [handoffTraceId, traceId] },
+    signal => new Promise<string>((_resolve, reject) => {
+      signal.addEventListener("abort", () => {
+        aborted = true;
+        reject(signal.reason);
+      }, { once: true });
+    }),
+  );
+
+  try {
+    await Bun.sleep(0);
+    const response = await fetch(`http://127.0.0.1:${server.port}/admin/cancel-turn`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${config.controlToken}`,
+      },
+      body: JSON.stringify({ traceId }),
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      status: "ok",
+      trace_id: traceId,
+      cancelled_compaction_runs: 1,
+    });
+    await expect(run).rejects.toThrow("The ChatGPT browser tab was closed");
+    expect(aborted).toBeTrue();
+  } finally {
+    await server.stop(true);
+  }
+});
+
+test("authenticated cancel-all aborts fresh structured compaction work", async () => {
+  const config = { ...defaultConfig("browser-only"), port: 0 };
+  const server = startServer(config);
+  const key = `structured-all-${Date.now()}-${Math.random()}`;
+  let aborted = false;
+  const run = runStructuredCompactionOnce(
+    key,
+    { ownerKey: `owner-${key}`, traceIds: [`trace-${key}`] },
+    signal => new Promise<string>((_resolve, reject) => {
+      signal.addEventListener("abort", () => {
+        aborted = true;
+        reject(signal.reason);
+      }, { once: true });
+    }),
+  );
+
+  try {
+    await Bun.sleep(0);
+    const response = await fetch(`http://127.0.0.1:${server.port}/admin/cancel-turns`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${config.controlToken}` },
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      status: "ok",
+      cancelled_compaction_runs: 1,
+    });
+    await expect(run).rejects.toThrow("Active turn cancelled by launcher");
+    expect(aborted).toBeTrue();
+  } finally {
     await server.stop(true);
   }
 });
@@ -440,7 +963,7 @@ test("a restart recovery turn without a new user instruction fails terminally in
   expect(adapterConstructions).toBe(0);
 });
 
-test("authenticated lifecycle control aborts active HTTP work before acknowledging cancellation", async () => {
+test.each(["alpha/search", "images/generations"])("authenticated lifecycle control aborts active %s before acknowledging cancellation", async path => {
   const config = { ...defaultConfig("browser-only"), port: 0 };
   let upstreamAbortObserved = false;
   const server = startServer(config, {
@@ -452,13 +975,15 @@ test("authenticated lifecycle control aborts active HTTP work before acknowledgi
     }),
   });
   const endpoint = `http://127.0.0.1:${server.port}`;
-  const activeRequest = fetch(`${endpoint}/v1/alpha/search`, {
+  const activeRequest = fetch(`${endpoint}/v1/${path}`, {
     method: "POST",
     headers: {
       authorization: "Bearer test-codex-session",
       "content-type": "application/json",
     },
-    body: JSON.stringify({ query: "retained turn" }),
+    body: JSON.stringify(path === "alpha/search"
+      ? { query: "retained turn" }
+      : { model: "gpt-image-1", prompt: "A blue square" }),
   }).catch(() => null);
 
   try {
@@ -651,6 +1176,79 @@ test("server exposes authenticated standalone Web Search on the routed v1 base U
     expect(await upstreamRequest!.json()).toEqual({ query: "bridge route" });
   } finally {
     await server.stop(true);
+  }
+});
+
+test("standalone native image generation and edits preserve their upstream protocol", async () => {
+  const config = { ...defaultConfig("browser-only"), port: 0 };
+  const requests: Request[] = [];
+  const reply = '{ "created": 1778832973, "data": [{ "b64_json": "native-image-bytes" }] }';
+  const denied = '{ "error": { "code": "rate_limit_exceeded", "message": "Image allowance reached" } }';
+  const upstreamServer = Bun.serve({
+    port: 0,
+    fetch: request => {
+      const edit = new URL(request.url).pathname.endsWith("/edits");
+      return new Response(Bun.gzipSync(edit ? denied : reply), {
+        status: edit ? 429 : 200,
+        headers: {
+          "content-type": "application/json", "content-encoding": "gzip",
+          "x-codex-imagegen-request-id": "native-image-request",
+        },
+      });
+    },
+  });
+  const server = startServer(config, {
+    fetchUpstream: async request => {
+      requests.push(request);
+      const path = new URL(request.url).pathname;
+      return fetch(new Request(`http://127.0.0.1:${upstreamServer.port}${path}`, request.clone()));
+    },
+  });
+  const endpoint = `http://127.0.0.1:${server.port}`;
+  try {
+    for (const operation of ["generations", "edits"] as const) {
+      const body = operation === "generations"
+        ? '{ "model": "gpt-image-1", "prompt": "A blue square", "n": 1 }'
+        : '{ "model": "gpt-image-1", "prompt": "Make it green", "images": [{ "image_url": "data:image/png;base64,AAAA" }] }';
+      const response = await fetch(`${endpoint}/v1/images/${operation}?fixture=1`, {
+        method: "POST",
+        headers: {
+          authorization: "Bearer test-codex-session",
+          "content-type": "application/json",
+          "chatgpt-account-id": "test-account",
+          "x-codex-image-turn-id": "native-image-turn",
+        },
+        body,
+      });
+      expect(response.status).toBe(operation === "generations" ? 200 : 429);
+      expect(await response.text()).toBe(operation === "generations" ? reply : denied);
+      expect(response.headers.get("content-encoding")).toBeNull();
+      expect(response.headers.get("x-codex-imagegen-request-id")).toBe("native-image-request");
+      const upstream = requests.at(-1)!;
+      expect(upstream.url).toBe(`https://chatgpt.com/backend-api/codex/images/${operation}?fixture=1`);
+      expect(upstream.method).toBe("POST");
+      expect(upstream.redirect).toBe("manual");
+      expect(upstream.headers.get("authorization")).toBe("Bearer test-codex-session");
+      expect(upstream.headers.get("chatgpt-account-id")).toBe("test-account");
+      expect(upstream.headers.get("x-codex-image-turn-id")).toBe("native-image-turn");
+      expect(upstream.headers.get("host")).toBeNull();
+      expect(await upstream.text()).toBe(body);
+    }
+    expect(requests).toHaveLength(2);
+    const unauthorized = await fetch(`${endpoint}/v1/images/generations`, { method: "POST", body: "{}" });
+    expect(unauthorized.status).toBe(401);
+    expect(requests).toHaveLength(2);
+    await fetch(`${endpoint}/admin/drain`, {
+      method: "POST", headers: { authorization: `Bearer ${config.controlToken}` },
+    });
+    const drained = await fetch(`${endpoint}/v1/images/edits`, {
+      method: "POST", headers: { authorization: "Bearer test-codex-session" }, body: "{}",
+    });
+    expect(drained.status).toBe(503);
+    expect(requests).toHaveLength(2);
+  } finally {
+    await server.stop(true);
+    await upstreamServer.stop(true);
   }
 });
 

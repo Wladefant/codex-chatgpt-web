@@ -71,6 +71,55 @@ test("targeted tab cancellation settles one trace and keeps a terminal replay to
   sessions.clear();
 });
 
+test("native interruption retires only the exact browser turn identity", async () => {
+  const sessions = new ChatGptTurnSessions();
+  const cancelled: string[] = [];
+  const runtime = (name: string) => {
+    let rejectBrowser!: (error: Error) => void;
+    const browser = new Promise<string>((_resolve, reject) => { rejectBrowser = reject; });
+    return {
+      mode: "read-only" as const,
+      browser,
+      physicalSettlement: browser.then(() => undefined, () => undefined),
+      trace: new ChatGptTraceFeed(),
+      text: new ChatGptTextFeed(),
+      cancel: (reason?: Error) => {
+        cancelled.push(name);
+        rejectBrowser(reason ?? new Error("cancelled"));
+      },
+    };
+  };
+  sessions.getOrCreate(
+    "target",
+    () => runtime("target"),
+    "trace_target",
+    "owner_target",
+    "turn_shared",
+    "thread_target",
+  );
+  sessions.getOrCreate(
+    "other-thread",
+    () => runtime("other-thread"),
+    "trace_other",
+    "owner_other",
+    "turn_shared",
+    "thread_other",
+  );
+
+  const cancellation = sessions.cancelNativeTurn(
+    "thread_target",
+    "turn_shared",
+    new DOMException("Codex turn interrupted", "AbortError"),
+  );
+  expect(cancellation.cancelled).toBe(1);
+  await cancellation.settlement;
+  expect(cancelled).toEqual(["target"]);
+  expect(sessions.find("target")).toBeUndefined();
+  expect(sessions.find("other-thread")?.nativeThreadId).toBe("thread_other");
+  expect(sessions.activeCount()).toBe(1);
+  sessions.clear();
+});
+
 test("session cache expiry never cancels a still-active long browser turn", async () => {
   const sessions = new ChatGptTurnSessions(1);
   let cancelled = 0;
@@ -164,6 +213,18 @@ test("turn broker creates its private runtime directory on a cold start", async 
   } finally {
     await broker.close();
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("turn broker rejects a Unix socket path that leaves no room for sun_path's NUL terminator", async () => {
+  if (process.platform === "win32") return;
+  const socketPath = `/tmp/${"x".repeat(99)}`;
+  expect(Buffer.byteLength(socketPath)).toBe(104);
+  const broker = TurnBroker.forSocket(socketPath);
+  try {
+    await expect(broker.listen()).rejects.toThrow("103-byte limit");
+  } finally {
+    await broker.close();
   }
 });
 
