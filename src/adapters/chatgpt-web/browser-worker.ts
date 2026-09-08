@@ -1479,9 +1479,18 @@ export class ChatGptBrowserWorker {
     if (!existsSync(this.config.chromeExecutablePath)) {
       throw new Error(`Configured Chrome executable does not exist: ${this.config.chromeExecutablePath}`);
     }
+    const ignoreDefaultArgs = process.platform === "win32"
+      ? ["--no-sandbox", "--password-store=basic", "--use-mock-keychain"]
+      : ["--password-store=basic", "--use-mock-keychain"];
     this.browser = await chromium.launch({
       executablePath: this.config.chromeExecutablePath,
       headless: !this.config.headed,
+      ignoreDefaultArgs,
+      args: [
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-blink-features=AutomationControlled",
+      ],
     });
     this.context = await this.browser.newContext({ storageState: this.config.storageStatePath });
     this.page = await this.context.newPage();
@@ -1497,9 +1506,18 @@ export class ChatGptBrowserWorker {
       if (!existsSync(this.config.chromeExecutablePath)) {
         throw new Error(`Configured Chrome executable does not exist: ${this.config.chromeExecutablePath}`);
       }
+      const ignoreDefaultArgs = process.platform === "win32"
+        ? ["--no-sandbox", "--password-store=basic", "--use-mock-keychain"]
+        : ["--password-store=basic", "--use-mock-keychain"];
       const browser = await chromium.launch({
         executablePath: this.config.chromeExecutablePath,
         headless: !this.config.headed,
+        ignoreDefaultArgs,
+        args: [
+          "--no-first-run",
+          "--no-default-browser-check",
+          "--disable-blink-features=AutomationControlled",
+        ],
       });
       const context = await browser.newContext({ storageState: this.config.storageStatePath });
       this.browser = browser;

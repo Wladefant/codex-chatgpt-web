@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import { createInterface } from "node:readline/promises";
+import { spawn } from "node:child_process";
 import { Writable } from "node:stream";
 import { timingSafeEqual } from "node:crypto";
 import { existsSync, rmSync } from "node:fs";
@@ -421,7 +422,8 @@ async function main(): Promise<void> {
     const config = loadConfig();
     const server = startServer(config);
     stdout.write(`codex-chatgpt-web ${VERSION} listening on http://${config.host}:${server.port}/v1 (${config.mode})\n`);
-    await new Promise<void>(() => {});
+    const { promise } = Promise.withResolvers<void>();
+    await promise;
   } else if (command === "dev") await runDevCommand(args);
   else if (command === "mcp") await runChatGptMcpMain(args);
   else if (command === "service") await serviceCommand(args);
