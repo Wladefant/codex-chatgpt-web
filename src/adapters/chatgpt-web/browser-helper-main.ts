@@ -87,6 +87,8 @@ const writeProtocol = (message: unknown): boolean => protocolOutput.write(JSON.s
 const diagnostic = (...values: unknown[]): void => {
   diagnosticOutput.write(values.map(value => typeof value === "string" ? value : JSON.stringify(value)).join(" "));
 };
+console.log = diagnostic;
+console.debug = diagnostic;
 console.info = diagnostic;
 console.warn = diagnostic;
 console.error = diagnostic;

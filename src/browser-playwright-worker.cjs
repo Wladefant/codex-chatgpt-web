@@ -1,7 +1,4 @@
 const { chromium } = require("playwright-core");
-const fs = require("node:fs");
-const path = require("node:path");
-const os = require("node:os");
 
 const CHATGPT_TEMPORARY_CHAT_URL = "https://chatgpt.com/?temporary-chat=true";
 const CHATGPT_COMPOSER_SELECTOR = [
@@ -21,15 +18,6 @@ const CHATGPT_EFFORT_MENU_SELECTOR = [
 const CHATGPT_EFFORT_ITEM_SELECTOR = '[role="menuitemradio"]';
 const CHATGPT_EFFORT_SLIDER_SELECTOR = '[data-model-reasoning-effort-slider] [role="slider"]';
 
-function clearLocks(dir) {
-  const locks = ["SingletonLock", "SingletonCookie", "SingletonSocket", "lockfile"];
-  for (const name of locks) {
-    const p = path.join(dir, name);
-    if (fs.existsSync(p)) {
-      try { fs.rmSync(p, { force: true }); } catch {}
-    }
-  }
-}
 
 async function detectCapabilities(page) {
   const effortButton = page.locator(CHATGPT_EFFORT_CONTROL_SELECTOR).last();
@@ -57,79 +45,50 @@ async function detectCapabilities(page) {
 }
 
 async function verifyWithBrowser(chromeExecutablePath, storageState, timeoutMs = 60000) {
-  const ignoreDefaultArgs = process.platform === "win32"
-    ? ["--no-sandbox", "--password-store=basic", "--use-mock-keychain"]
-    : ["--password-store=basic", "--use-mock-keychain"];
-
-  let lastError;
-  for (const headless of [true, false]) {
-    let browser;
-    try {
-      browser = await chromium.launch({
-        executablePath: chromeExecutablePath,
-        headless,
-        ignoreDefaultArgs,
-        args: [
-          "--no-first-run",
-          "--no-default-browser-check",
-          ...(headless ? ["--disable-blink-features=AutomationControlled"] : []),
-        ],
-        timeout: timeoutMs,
-      });
-
-      const context = await browser.newContext({
-        storageState,
-        userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
-      });
-      try {
-        const page = await context.newPage();
-        await page.goto(CHATGPT_TEMPORARY_CHAT_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
-        const composer = page.locator(CHATGPT_COMPOSER_SELECTOR).first();
-        await composer.waitFor({ state: "visible", timeout: headless ? 20000 : timeoutMs });
-
-        const capabilities = await detectCapabilities(page);
-        return capabilities;
-      } finally {
-        await context.close();
-      }
-    } catch (err) {
-      lastError = err;
-      if (!headless) throw err;
-    } finally {
-      if (browser) await browser.close();
-    }
+  const browser = await chromium.launch({
+    executablePath: chromeExecutablePath,
+    headless: true,
+    ignoreDefaultArgs: process.platform === "win32"
+      ? ["--no-sandbox", "--password-store=basic", "--use-mock-keychain"]
+      : ["--password-store=basic", "--use-mock-keychain"],
+    args: ["--no-first-run", "--no-default-browser-check", "--disable-blink-features=AutomationControlled"],
+    timeout: timeoutMs,
+  });
+  try {
+    const context = await browser.newContext({
+      storageState,
+      ...(process.platform === "win32" ? {
+        userAgent: `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${browser.version()} Safari/537.36`,
+      } : {}),
+    });
+    const page = await context.newPage();
+    await page.goto(CHATGPT_TEMPORARY_CHAT_URL, { waitUntil: "domcontentloaded", timeout: timeoutMs });
+    await page.locator(CHATGPT_COMPOSER_SELECTOR).first().waitFor({ state: "visible", timeout: timeoutMs });
+    return await detectCapabilities(page);
+  } finally {
+    await browser.close();
   }
-  throw lastError;
 }
 
 async function extractAndVerify(params) {
   const { profileDir, chromeExecutablePath, timeoutMs = 60000 } = params;
-  const copyDir = path.join(os.tmpdir(), "codex-login-copy-" + Date.now());
-  fs.cpSync(profileDir, copyDir, { recursive: true });
-  clearLocks(copyDir);
-
-  const ignoreDefaultArgs = process.platform === "win32"
-    ? ["--no-sandbox", "--password-store=basic", "--use-mock-keychain"]
-    : ["--password-store=basic", "--use-mock-keychain"];
-
+  // The owned login browser has exited. Open that profile directly; Chrome arbitrates
+  // its own locks. Never copy a live profile, remove its locks, or kill a name match.
+  const context = await chromium.launchPersistentContext(profileDir, {
+    executablePath: chromeExecutablePath,
+    headless: true,
+    ignoreDefaultArgs: process.platform === "win32"
+      ? ["--no-sandbox", "--password-store=basic", "--use-mock-keychain"]
+      : ["--password-store=basic", "--use-mock-keychain"],
+    args: ["--no-first-run", "--no-default-browser-check"],
+    timeout: timeoutMs,
+  });
   let state;
   try {
-    const context = await chromium.launchPersistentContext(copyDir, {
-      executablePath: chromeExecutablePath,
-      headless: true,
-      ignoreDefaultArgs,
-      args: ["--no-first-run", "--no-default-browser-check"],
-      timeout: timeoutMs,
-    });
-    try {
-      state = await context.storageState();
-    } finally {
-      await context.close();
-    }
+    state = await context.storageState();
   } finally {
-    fs.rmSync(copyDir, { recursive: true, force: true });
+    await context.close();
   }
-
   const inspected = await verifyWithBrowser(chromeExecutablePath, state, timeoutMs);
   return { state, inspected };
 }

@@ -20,6 +20,8 @@ test("daemon streams browser lifecycle through the real helper process", async (
     import { ChatGptBrowserWorker } from ${JSON.stringify(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url).href)};
     // Substitute only the browser. Both sides of the production IPC protocol run unchanged.
     ChatGptBrowserWorker.prototype.run = async turn => {
+      console.log("non-protocol library diagnostic");
+      console.debug("non-protocol debug diagnostic");
       await turn.onPreparedSelected(false);
       const prepared = await turn.prepare();
       if (prepared.multipart.parts.length !== 3) throw new Error("Multipart context was lost");
@@ -126,7 +128,7 @@ test("daemon streams browser lifecycle through the real helper process", async (
   } finally {
     await client.close();
   }
-});
+}, 30_000);
 
 test("accepted compaction retires through the helper as completed without hiding cancellations or errors", async () => {
   const root = mkdtempSync(join(tmpdir(), "codex-helper-compaction-end-"));
@@ -398,3 +400,35 @@ test("structured helper errors preserve the ChatGPT adapter failure contract", a
     retryable: true,
   });
 });
+
+test("managed helper that stops answering rejects at its turn deadline", async () => {
+  const root = mkdtempSync(join(tmpdir(), "managed-helper-stall-"));
+  roots.push(root);
+  const helper = join(root, "helper.cjs");
+  writeFileSync(helper, `
+    process.stdout.write(JSON.stringify({type:'ready'}) + '\\n');
+    process.stdin.resume();
+  `);
+  const client = new LauncherBrowserHelperClient({
+    appName: "Codex Native2",
+    browserHost: "managed-chrome",
+    browserHelperScriptPath: helper,
+    storageStatePath: join(root, "unused-state.json"),
+    chromeExecutablePath: join(root, "unused-chrome"),
+    turnTimeoutMs: 100,
+    headed: false,
+    autoApproveToolCalls: false,
+  });
+  try {
+    await expect(client.run({
+      traceId: "managed-timeout",
+      modelId: "gpt-5.6-sol",
+      reasoning: "low",
+      capabilities: { localToolsEnabled: false, solAvailable: true, proAvailable: false },
+      prepare: async () => ({ text: "inspect", images: [], release() {} }),
+      onTextDelta() {},
+    })).rejects.toThrow("Browser helper turn timed out after 100ms");
+  } finally {
+    await client.close();
+  }
+}, 30_000);

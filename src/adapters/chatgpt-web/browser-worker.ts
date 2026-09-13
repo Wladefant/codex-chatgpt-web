@@ -2279,8 +2279,12 @@ export class ChatGptBrowserWorker {
         "--disable-blink-features=AutomationControlled",
       ],
     });
-    const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
-    this.context = await this.browser.newContext({ storageState: this.config.storageStatePath, userAgent });
+    this.context = await this.browser.newContext({
+      storageState: this.config.storageStatePath,
+      ...(process.platform === "win32" ? {
+        userAgent: `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${this.browser.version()} Safari/537.36`,
+      } : {}),
+    });
     this.page = await this.context.newPage();
     return this.page;
   }
@@ -2307,8 +2311,12 @@ export class ChatGptBrowserWorker {
           "--disable-blink-features=AutomationControlled",
         ],
       });
-      const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
-      const context = await browser.newContext({ storageState: this.config.storageStatePath, userAgent });
+      const context = await browser.newContext({
+        storageState: this.config.storageStatePath,
+        ...(process.platform === "win32" ? {
+          userAgent: `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${browser.version()} Safari/537.36`,
+        } : {}),
+      });
       this.browser = browser;
       this.context = context;
       return { browser, context };

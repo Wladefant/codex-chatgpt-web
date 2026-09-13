@@ -1,10 +1,11 @@
-import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium, type BrowserContext, type BrowserContextOptions } from "playwright-core";
 import type { AppConfig } from "./config";
 import { atomicWriteFile } from "./config";
+import { runBrowserWorker, spawnBrowserProcess, stopBrowserProcess } from "./browser-process";
 import {
   assertAuthenticatedChatGptPage,
   assertTemporaryChatPage,
@@ -154,55 +155,12 @@ function writeVerificationMarker(
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-function clearProfileLocks(dir: string): void {
-  const locks = ["SingletonLock", "SingletonCookie", "SingletonSocket", "lockfile"];
-  for (const name of locks) {
-    const p = join(dir, name);
-    if (existsSync(p)) {
-      try { rmSync(p, { force: true }); } catch {}
-    }
-  }
-}
-
-function killChromeProcessesForProfile(profileDir: string): void {
-  if (process.platform !== "win32") return;
-  try {
-    const escaped = profileDir.replace(/\\/g, "\\\\");
-    spawnSync("powershell.exe", [
-      "-NoProfile",
-      "-Command",
-      `Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Where-Object { $_.CommandLine -like '*${escaped}*' } | Stop-Process -Force`,
-    ], { stdio: "ignore", timeout: 10_000 });
-  } catch {}
-}
 
 function runWorker<T>(action: string, params: Record<string, unknown>): Promise<T> {
-  const { promise, resolve, reject } = Promise.withResolvers<T>();
-  const workerPath = join(__dirname, "browser-playwright-worker.cjs");
-  const proc = spawn("node", [workerPath], {
-    stdio: ["pipe", "pipe", "pipe"],
-    windowsHide: true,
-  });
-  let stdoutData = "";
-  let stderrData = "";
-  proc.stdout.on("data", chunk => { stdoutData += chunk; });
-  proc.stderr.on("data", chunk => { stderrData += chunk; });
-  proc.on("error", reject);
-  proc.on("close", code => {
-    if (code !== 0) {
-      return reject(new Error(stderrData.trim() || `Playwright worker failed with exit code ${code}`));
-    }
-    try {
-      const parsed = JSON.parse(stdoutData.trim());
-      if (!parsed.ok) return reject(new Error(parsed.error));
-      resolve(parsed.result as T);
-    } catch {
-      reject(new Error(`Failed to parse Playwright worker response: ${stdoutData.slice(0, 200)}`));
-    }
-  });
-  proc.stdin.write(JSON.stringify({ action, params }));
-  proc.stdin.end();
-  return promise;
+  return runBrowserWorker<T>(
+    join(__dirname, "browser-playwright-worker.cjs"), action, params,
+    typeof params.timeoutMs === "number" ? params.timeoutMs : 60_000,
+  );
 }
 
 async function inspectStoredState(
@@ -472,34 +430,40 @@ export async function loginToChatGpt(
   const profileDir = join(dirname(config.storageStatePath), "login-profile");
   mkdirSync(profileDir, { recursive: true, mode: 0o700 });
 
-  killChromeProcessesForProfile(profileDir);
-  clearProfileLocks(profileDir);
-
   process.stdout.write(
     "A normal Chrome window is open. Sign in to ChatGPT (or confirm you are already signed in and see the composer), then quit this dedicated Chrome instance completely.\n",
   );
-  const loginBrowser = spawn(config.chromeExecutablePath, [
+  const loginBrowser = spawnBrowserProcess(config.chromeExecutablePath, [
     `--user-data-dir=${profileDir}`,
     "--new-window",
     "--disable-background-mode",
     "--no-first-run",
     "--no-default-browser-check",
     CHATGPT_TEMPORARY_CHAT_URL,
-  ], { env: process.env, stdio: "ignore" });
+  ]);
+  loginBrowser.stdout.resume();
+  loginBrowser.stderr.resume();
+  loginBrowser.stdin.on("error", () => {});
   const { promise: exitPromise, resolve: resolveExit, reject: rejectExit } = Promise.withResolvers<number>();
   loginBrowser.once("error", rejectExit);
   loginBrowser.once("exit", (code, signal) => {
     if (signal) rejectExit(new Error(`Normal Chrome login window exited from signal ${signal}`));
     else resolveExit(code ?? 1);
   });
-  const loginExit = await exitPromise;
+  const timeoutMs = options.timeoutMs ?? SYSTEM_LOGIN_TIMEOUT_MS;
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    await stopBrowserProcess(loginBrowser);
+    throw new Error("Login timeout must be positive and finite");
+  }
+  const timer = setTimeout(() => rejectExit(new Error(`Chrome login timed out after ${timeoutMs}ms`)), timeoutMs);
+  let loginExit: number;
+  try {
+    loginExit = await exitPromise;
+  } finally {
+    clearTimeout(timer);
+    await stopBrowserProcess(loginBrowser);
+  }
   if (loginExit !== 0) throw new Error(`Normal Chrome login window exited with status ${loginExit}`);
-
-  const { promise: sleepPromise, resolve: resolveSleep } = Promise.withResolvers<void>();
-  setTimeout(resolveSleep, 1000);
-  await sleepPromise;
-  killChromeProcessesForProfile(profileDir);
-  clearProfileLocks(profileDir);
 
   const { state, inspected } = await extractAndVerifyState(profileDir, config.chromeExecutablePath, options.timeoutMs);
 
