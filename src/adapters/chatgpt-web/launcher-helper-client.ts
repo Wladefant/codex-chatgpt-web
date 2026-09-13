@@ -1,8 +1,9 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { notifyLauncherTurn, readLauncherBrowserHostDescriptor } from "../../launcher-browser-host";
+import { browserNodeExecutable, spawnBrowserProcess, stopBrowserProcess } from "../../browser-process";
 import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError } from "./adapter-error";
 import type { CompiledChatGptWebPrompt } from "./prompt";
 import type { BrowserTurn, ResolvedBrowserConfig } from "./browser-worker";
@@ -21,6 +22,7 @@ interface PendingTurn {
   localFailure?: Error;
   progressForwarding?: AbortController;
   acknowledgedMultipartStage?: number;
+  deadline?: NodeJS.Timeout;
 }
 
 type HelperMessage =
@@ -234,6 +236,16 @@ export class LauncherBrowserHelperClient {
         }
         const pending: PendingTurn = { turn, resolve: resolveResult, reject: rejectResult };
         this.pending.set(turn.traceId, pending);
+        const timeoutMs = this.config.turnTimeoutMs ?? 30 * 60_000;
+        pending.deadline = setTimeout(() => {
+          const child = this.child;
+          const error = new Error(`Browser helper turn timed out after ${timeoutMs}ms`);
+          this.finishWithError(turn.traceId, error);
+          if (child) {
+            this.handleExit(child, error);
+            void this.terminateChild(child, 0).catch(error => console.error(error));
+          }
+        }, timeoutMs);
         if (turn.abortSignal) {
           const abortListener = () => {
             if (!pending.sent) {
@@ -273,7 +285,11 @@ export class LauncherBrowserHelperClient {
           id: turn.traceId,
           config: {
             appName: this.config.appName,
-            browserHostDescriptorPath: this.config.browserHostDescriptorPath!,
+            browserHost: this.config.browserHost,
+            browserHostDescriptorPath: this.config.browserHostDescriptorPath,
+            chromeExecutablePath: this.config.chromeExecutablePath,
+            storageStatePath: this.config.storageStatePath,
+            headed: this.config.headed,
             browserDiagnosticsPath: this.config.browserDiagnosticsPath,
             turnTimeoutMs: this.config.turnTimeoutMs,
             autoApproveToolCalls: this.config.autoApproveToolCalls,
@@ -312,8 +328,39 @@ export class LauncherBrowserHelperClient {
       this.finishWithError(id, new DOMException("Launcher browser helper is closing", "AbortError"));
     }
     if (!child) return;
-    await this.sendTo(child, { type: "shutdown" }).catch(() => {});
     await this.terminateChild(child, 2_000);
+  }
+
+  private resolveManagedBrowserHelperScript(): string {
+    if (this.config.browserHelperScriptPath && existsSync(this.config.browserHelperScriptPath)) {
+      return this.config.browserHelperScriptPath;
+    }
+    const bundled = this.bundledHelperScript();
+    if (bundled) return bundled;
+    const root = resolve(import.meta.dir, "..", "..", "..");
+    const candidates = [
+      resolve(root, ".launcher-runtime", "browser-helper.cjs"),
+      resolve(root, "dist", "runtime", "app", "browser-helper.cjs"),
+      resolve(root, "dist", "browser-helper.cjs"),
+      resolve(import.meta.dir, "browser-helper.cjs"),
+    ];
+    for (const candidate of candidates) {
+      if (existsSync(candidate)) return candidate;
+    }
+    const buildScript = join(root, "scripts", "build-browser-helper.ts");
+    if (existsSync(buildScript)) {
+      const output = join(root, ".launcher-runtime", "browser-helper.cjs");
+      const bunExe = typeof Bun !== "undefined" ? process.execPath : "bun";
+      const build = spawnSync(bunExe, ["run", buildScript, output], {
+        cwd: root,
+        stdio: "pipe",
+        timeout: 30_000,
+      });
+      if (build.status === 0 && existsSync(output)) {
+        return output;
+      }
+    }
+    throw new Error("ChatGPT Web managed browser helper script could not be found or built");
   }
 
   private async ensureChild(): Promise<void> {
@@ -324,20 +371,27 @@ export class LauncherBrowserHelperClient {
       && this.ready) {
       return this.ready;
     }
-    const descriptor = readLauncherBrowserHostDescriptor(this.config.browserHostDescriptorPath!);
-    const child = spawn(
-      descriptor.helper.executable,
-      [this.config.browserHelperScriptPath ?? this.bundledHelperScript() ?? descriptor.helper.script],
-      {
-        env: {
-          ...process.env,
-          ELECTRON_RUN_AS_NODE: "1",
-          CODEX_CHATGPT_WEB_BROWSER_HELPER_PROCESS: "1",
-        },
-        stdio: ["pipe", "pipe", "pipe"],
-        windowsHide: true,
-      },
-    );
+    let executable: string;
+    let script: string;
+    let env: Record<string, string | undefined>;
+    if (this.config.browserHost === "launcher") {
+      const descriptor = readLauncherBrowserHostDescriptor(this.config.browserHostDescriptorPath!);
+      executable = descriptor.helper.executable;
+      script = this.config.browserHelperScriptPath ?? this.bundledHelperScript() ?? descriptor.helper.script;
+      env = {
+        ...process.env,
+        ELECTRON_RUN_AS_NODE: "1",
+        CODEX_CHATGPT_WEB_BROWSER_HELPER_PROCESS: "1",
+      };
+    } else {
+      executable = browserNodeExecutable();
+      script = this.resolveManagedBrowserHelperScript();
+      env = {
+        ...process.env,
+        CODEX_CHATGPT_WEB_BROWSER_HELPER_PROCESS: "1",
+      };
+    }
+    const child = spawnBrowserProcess(executable, [script], env);
     this.child = child;
     this.ready = new Promise<void>((resolveReady, rejectReady) => {
       this.readyResolve = resolveReady;
@@ -627,6 +681,7 @@ export class LauncherBrowserHelperClient {
   private finish(id: string): void {
     const pending = this.pending.get(id);
     if (!pending) return;
+    clearTimeout(pending.deadline);
     if (pending.abortListener && pending.turn.abortSignal) {
       pending.turn.abortSignal.removeEventListener("abort", pending.abortListener);
     }
@@ -654,6 +709,10 @@ export class LauncherBrowserHelperClient {
     for (const id of [...this.pending.keys()]) {
       const pending = this.pending.get(id);
       if (!pending) continue;
+      if (this.config.browserHost !== "launcher") {
+        this.finishWithError(id, pending.localFailure ?? error);
+        continue;
+      }
       void notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
         phase: "end",
         traceId: id,
@@ -673,39 +732,9 @@ export class LauncherBrowserHelperClient {
     }
   }
 
-  private async waitForExit(child: ChildProcessWithoutNullStreams, timeoutMs: number): Promise<boolean> {
-    if (child.exitCode !== null || child.signalCode !== null) return true;
-    return await new Promise<boolean>(resolveExit => {
-      let settled = false;
-      const finish = (exited: boolean) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        child.off("exit", onExit);
-        child.off("close", onExit);
-        resolveExit(exited);
-      };
-      const onExit = () => finish(true);
-      const timer = setTimeout(() => finish(false), timeoutMs);
-      child.once("exit", onExit);
-      child.once("close", onExit);
-    });
-  }
 
   private async terminateChild(child: ChildProcessWithoutNullStreams, gracefulTimeoutMs: number): Promise<void> {
-    if (child.exitCode !== null || child.signalCode !== null) return;
-    child.stdin.end();
-    if (await this.waitForExit(child, gracefulTimeoutMs)) return;
-    if (!child.kill("SIGTERM") && child.exitCode === null && child.signalCode === null) {
-      throw new Error("Launcher browser helper refused termination");
-    }
-    if (await this.waitForExit(child, 2_000)) return;
-    if (!child.kill("SIGKILL") && child.exitCode === null && child.signalCode === null) {
-      throw new Error("Launcher browser helper refused forced termination");
-    }
-    if (!await this.waitForExit(child, 2_000)) {
-      throw new Error("Launcher browser helper did not exit after forced termination");
-    }
+    await stopBrowserProcess(child, gracefulTimeoutMs);
   }
 
   private send(message: unknown): Promise<void> {

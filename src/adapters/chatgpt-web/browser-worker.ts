@@ -522,10 +522,10 @@ async function ensureChatGptPersonalizedConnectorAccessWithinDeadline(
   // The visible sheet can be aria-hidden during hydration. Include those controls in the role
   // query but still require visibility; never select a hidden duplicate or switch locator rules.
   const personalized = page
-    .getByRole("button", { name: "Personalized", exact: true, includeHidden: true })
+    .getByRole("button", { name: /^(?:Personalized|个性化)$/, exact: true, includeHidden: true })
     .filter({ visible: true });
   const unpersonalized = page
-    .getByRole("button", { name: "Unpersonalized", exact: true, includeHidden: true })
+    .getByRole("button", { name: /^(?:Unpersonalized|非个性化)$/, exact: true, includeHidden: true })
     .filter({ visible: true });
   let personalizedCount = await runChatGptPersonalizationStep(() => personalized.count(), deadline, abortSignal);
   let unpersonalizedCount = await runChatGptPersonalizationStep(() => unpersonalized.count(), deadline, abortSignal);
@@ -600,7 +600,7 @@ async function ensureChatGptPersonalizedConnectorAccessWithinDeadline(
     );
     const choice = menu
       .locator(CHATGPT_PERSONALIZATION_CHOICE_SELECTOR)
-      .filter({ hasText: /^Personalized/ });
+      .filter({ hasText: /^(?:Personalized|个性化)/ });
     if (await runChatGptPersonalizationStep(() => choice.count(), deadline, abortSignal) !== 1) {
       throw chatGptConnectorUnavailableError(
         "ChatGPT personalization menu did not expose one exact Personalized choice",
@@ -1946,8 +1946,8 @@ export function resolveBrowserConfig(provider: CodexProviderConfig): ResolvedBro
   if (browserHost === "launcher" && !browserHostDescriptorPath) {
     throw new Error("Launcher browser host requires chatgptWeb.browserHostDescriptorPath");
   }
-  if (browserHelperScriptPath && browserHost !== "launcher") {
-    throw new Error("Explicit browser helper script requires a launcher host");
+  if (browserHelperScriptPath && browserHost !== "launcher" && (browserHost !== "managed-chrome" || process.platform !== "win32")) {
+    throw new Error("Explicit browser helper script requires a launcher host or Windows managed-chrome");
   }
   const resolvedBrowserHelperScriptPath = browserHelperScriptPath
     ? resolve(expandUserPath(browserHelperScriptPath))
@@ -2131,7 +2131,9 @@ export class ChatGptBrowserWorker {
         `ChatGPT Web supports at most ${MAX_CHATGPT_BROWSER_TABS} simultaneous browser turns; close or finish a browser tab before starting another`,
       ));
     }
-    const useHelper = this.config.browserHost === "launcher" && process.env.CODEX_CHATGPT_WEB_BROWSER_HELPER_PROCESS !== "1";
+    const useHelper = (this.config.browserHost === "launcher" || (this.config.browserHost === "managed-chrome" && process.platform === "win32"))
+      && process.env.CODEX_CHATGPT_WEB_BROWSER_HELPER_PROCESS !== "1"
+      && !Object.hasOwn(this, "runExclusive");
     if (useHelper) {
       this.launcherHelper ??= new LauncherBrowserHelperClient(this.config);
     }
@@ -2264,11 +2266,25 @@ export class ChatGptBrowserWorker {
     if (!existsSync(this.config.chromeExecutablePath)) {
       throw new Error(`Configured Chrome executable does not exist: ${this.config.chromeExecutablePath}`);
     }
+    const ignoreDefaultArgs = process.platform === "win32"
+      ? ["--no-sandbox", "--password-store=basic", "--use-mock-keychain"]
+      : ["--password-store=basic", "--use-mock-keychain"];
     this.browser = await chromium.launch({
       executablePath: this.config.chromeExecutablePath,
       headless: !this.config.headed,
+      ignoreDefaultArgs,
+      args: [
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-blink-features=AutomationControlled",
+      ],
     });
-    this.context = await this.browser.newContext({ storageState: this.config.storageStatePath });
+    this.context = await this.browser.newContext({
+      storageState: this.config.storageStatePath,
+      ...(process.platform === "win32" ? {
+        userAgent: `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${this.browser.version()} Safari/537.36`,
+      } : {}),
+    });
     this.page = await this.context.newPage();
     return this.page;
   }
@@ -2282,11 +2298,25 @@ export class ChatGptBrowserWorker {
       if (!existsSync(this.config.chromeExecutablePath)) {
         throw new Error(`Configured Chrome executable does not exist: ${this.config.chromeExecutablePath}`);
       }
+      const ignoreDefaultArgs = process.platform === "win32"
+        ? ["--no-sandbox", "--password-store=basic", "--use-mock-keychain"]
+        : ["--password-store=basic", "--use-mock-keychain"];
       const browser = await chromium.launch({
         executablePath: this.config.chromeExecutablePath,
         headless: !this.config.headed,
+        ignoreDefaultArgs,
+        args: [
+          "--no-first-run",
+          "--no-default-browser-check",
+          "--disable-blink-features=AutomationControlled",
+        ],
       });
-      const context = await browser.newContext({ storageState: this.config.storageStatePath });
+      const context = await browser.newContext({
+        storageState: this.config.storageStatePath,
+        ...(process.platform === "win32" ? {
+          userAgent: `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${browser.version()} Safari/537.36`,
+        } : {}),
+      });
       this.browser = browser;
       this.context = context;
       return { browser, context };
@@ -4163,7 +4193,10 @@ export class ChatGptBrowserWorker {
 
   private async runExclusive(turn: BrowserTurn): Promise<string> {
     if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
-    if (this.config.browserHost !== "launcher") return this.runBrowserTurn(turn);
+    if (this.config.browserHost !== "launcher") {
+      await turn.onPreparedSelected?.(false);
+      return this.runBrowserTurn(turn);
+    }
 
     const lease = await notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
       phase: "start",

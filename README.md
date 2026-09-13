@@ -112,6 +112,31 @@ bun run app
 
 This source path requires Bun 1.4.0. The command installs locked dependencies and opens the app.
 
+**Windows managed-Chrome daemon reliability**
+
+The source-only managed-Chrome path additionally requires Node.js 22+ on `PATH` and installed
+Google Chrome. Windows runtime bundles carry their own Node executable and license, login worker,
+and native process supervisor; installing system Node is not required for those bundles.
+Windows bundle builds require the Node distribution's `LICENSE` beside `node.exe` and the Windows
+.NET Framework C# compiler. No runtime download or install is attempted when a browser starts.
+
+Browser helpers and their descendants belong to a Windows Job Object: closing the helper,
+its supervisor, or the owning daemon terminates the whole owned tree. The login worker has a
+60-second execution deadline by default (an explicit login timeout overrides it), and interactive
+login has a ten-minute default deadline. Helper turns use their configured deadline or a
+30-minute transport ceiling; stalled shutdown is forcefully bounded to two seconds.
+Background login verification is headless, with no automatic headed fallback. Login extraction
+opens the owned profile only after the login browser closes; it neither copies the profile nor
+removes another process's locks. Browser identity uses the running Chrome version, not Chrome 134.
+Protocol stdout is reserved for JSON; console diagnostics go to stderr.
+
+Native regression checks (including deliberate child/parent termination and empty-`PATH`
+packaged Node resolution):
+`bun test tests/browser-process.test.ts tests/browser-runtime-package.test.ts tests/browser-login.test.ts tests/launcher-helper-client.test.ts --timeout 30000`.
+
+Change history and the scoped review findings are recorded in
+[the Windows daemon remediation](https://github.com/Wladefant/codex-chatgpt-web/pull/1).
+
 ## Modes
 
 | Mode | Models | Local Codex tools | Extra setup |
