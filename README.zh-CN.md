@@ -107,7 +107,7 @@ bun run app
 
 **Windows 托管 Chrome 守护进程可靠性**
 
-仅源码的托管 Chrome 路径还需要 `PATH` 中的 Node.js 22+ 以及已安装的 Google Chrome。Windows 运行时 Bundle 自带 Node 可执行文件及许可证、登录 worker 和原生进程监督器；使用这些 Bundle 无需在系统上安装 Node。Windows Bundle 构建需要 Node 发行版的 `LICENSE` 位于 `node.exe` 旁边，以及 Windows .NET Framework C# 编译器。启动浏览器时不会尝试下载或安装运行时。
+仅源码的托管 Chrome 路径还需要 `PATH` 中的 Node.js 22+ 以及已安装的 Google Chrome。Windows 运行时 Bundle 自带 Node 可执行文件及许可证、登录 worker 和原生进程监督器；使用这些 Bundle 无需在系统上安装 Node。Windows Bundle 构建需要 Node 发行版的 `LICENSE`（位于 `node.exe` 旁边、其安装根目录下或仓库副本中），以及 Windows .NET Framework C# 编译器。启动浏览器时不会尝试下载或安装运行时。
 
 浏览器 helper 及其子进程属于一个 Windows Job Object：关闭 helper、其监督器或所属的守护进程将终止整个所属进程树。登录 worker 默认具有 60 秒的执行截止时间（显式登录超时会覆盖此设置），交互式登录默认具有 10 分钟的截止时间。Helper 回合使用其配置的截止时间或 30 分钟的传输上限；停滞的关闭将被强制限制在两秒内。后台登录验证是无头模式（headless），不会自动回退到有头模式（headed）。登录提取仅在登录浏览器关闭后才打开所属配置文件；它既不会复制配置文件，也不会移除其他进程的锁。浏览器标识使用正在运行的 Chrome 版本，而非 Chrome 134。协议 stdout 专用于 JSON；控制台诊断输出到 stderr。
 

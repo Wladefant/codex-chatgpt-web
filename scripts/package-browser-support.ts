@@ -1,5 +1,5 @@
 import { copyFileSync, existsSync, mkdirSync, realpathSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { browserNodeExecutable, buildWindowsProcessJob } from "../src/browser-process";
 
@@ -30,14 +30,16 @@ export function resolveNodeLicense(node: string, root: string): string {
   searched.push(siblingTxt);
   if (existsSync(siblingTxt)) return siblingTxt;
 
-  // 2. Node installation root (parent directory if node.exe is in bin/ or subfolder)
-  const nodeParent = dirname(nodeDir);
-  const parentLicense = join(nodeParent, "LICENSE");
-  searched.push(parentLicense);
-  if (existsSync(parentLicense)) return parentLicense;
-  const parentLicenseTxt = join(nodeParent, "LICENSE.txt");
-  searched.push(parentLicenseTxt);
-  if (existsSync(parentLicenseTxt)) return parentLicenseTxt;
+  // 2. Node installation root (parent directory if node.exe is in bin/)
+  if (basename(nodeDir).toLowerCase() === "bin") {
+    const nodeParent = dirname(nodeDir);
+    const parentLicense = join(nodeParent, "LICENSE");
+    searched.push(parentLicense);
+    if (existsSync(parentLicense)) return parentLicense;
+    const parentLicenseTxt = join(nodeParent, "LICENSE.txt");
+    searched.push(parentLicenseTxt);
+    if (existsSync(parentLicenseTxt)) return parentLicenseTxt;
+  }
 
   // 3. Symlink / shim target (e.g. fnm/volta/scoop shims pointing to real install)
   try {
@@ -51,38 +53,21 @@ export function resolveNodeLicense(node: string, root: string): string {
       searched.push(realSiblingTxt);
       if (existsSync(realSiblingTxt)) return realSiblingTxt;
 
-      const realParent = dirname(realDir);
-      const realParentLicense = join(realParent, "LICENSE");
-      searched.push(realParentLicense);
-      if (existsSync(realParentLicense)) return realParentLicense;
-      const realParentLicenseTxt = join(realParent, "LICENSE.txt");
-      searched.push(realParentLicenseTxt);
-      if (existsSync(realParentLicenseTxt)) return realParentLicenseTxt;
+      if (basename(realDir).toLowerCase() === "bin") {
+        const realParent = dirname(realDir);
+        const realParentLicense = join(realParent, "LICENSE");
+        searched.push(realParentLicense);
+        if (existsSync(realParentLicense)) return realParentLicense;
+        const realParentLicenseTxt = join(realParent, "LICENSE.txt");
+        searched.push(realParentLicenseTxt);
+        if (existsSync(realParentLicenseTxt)) return realParentLicenseTxt;
+      }
     }
   } catch {
     // Ignore realpath errors
   }
 
-  // 4. process.execPath installation root (if packaging is running under Node)
-  if (process.execPath) {
-    const execDir = dirname(process.execPath);
-    const execSibling = join(execDir, "LICENSE");
-    searched.push(execSibling);
-    if (existsSync(execSibling)) return execSibling;
-    const execSiblingTxt = join(execDir, "LICENSE.txt");
-    searched.push(execSiblingTxt);
-    if (existsSync(execSiblingTxt)) return execSiblingTxt;
-
-    const execParent = dirname(execDir);
-    const execParentLicense = join(execParent, "LICENSE");
-    searched.push(execParentLicense);
-    if (existsSync(execParentLicense)) return execParentLicense;
-    const execParentLicenseTxt = join(execParent, "LICENSE.txt");
-    searched.push(execParentLicenseTxt);
-    if (existsSync(execParentLicenseTxt)) return execParentLicenseTxt;
-  }
-
-  // 5. Version-matched copy shipped in the repository (LICENSES/ directory)
+  // 4. Version-matched copy shipped in the repository (LICENSES/ directory)
   const version = spawnSync(node, ["--version"], { encoding: "utf8", timeout: 5_000, windowsHide: true });
   const versionString = version.status === 0 ? version.stdout.trim() : "";
   const match = versionString.match(/^v(\d+)/);

@@ -109,3 +109,52 @@ import { packageBrowserSupport, resolveNodeLicense } from "../scripts/package-br
     rmSync(output, { recursive: true, force: true });
   }
 });
+
+(process.platform === "win32" ? test : test.skip)("resolveNodeLicense bounds lookup to selected Node install and does not select unrelated ambient parent license", () => {
+  const output = mkdtempSync(join(tmpdir(), "browser-runtime-ambient-"));
+  try {
+    const parentDir = join(output, "product");
+    const installDir = join(parentDir, "install");
+    mkdirSync(installDir, { recursive: true });
+
+    const fakeNode = join(installDir, "node.exe");
+    copyFileSync(browserNodeExecutable(), fakeNode);
+
+    // An unrelated LICENSE file in the parent directory of installDir
+    const unrelatedLicense = join(parentDir, "LICENSE");
+    writeFileSync(unrelatedLicense, "MIT License - Unrelated Product");
+
+    // With an empty repository root (no LICENSES/ fallback):
+    // Must NOT select the ambient parent license, but throw listing expected paths without parent license.
+    const emptyRepo = join(output, "empty-repo");
+    mkdirSync(emptyRepo, { recursive: true });
+
+    let error: Error | undefined;
+    try {
+      resolveNodeLicense(fakeNode, emptyRepo);
+    } catch (err) {
+      error = err as Error;
+    }
+    expect(error).toBeDefined();
+    expect(error?.message).toContain("Node.js distribution LICENSE is required");
+    expect(error?.message).not.toContain(unrelatedLicense);
+
+    // With the real repository root:
+    // Must NOT select the ambient parent license; should resolve to the repository fallback.
+    const root = resolve(import.meta.dir, "..");
+    const resolved = resolveNodeLicense(fakeNode, root);
+    expect(resolved).not.toBe(unrelatedLicense);
+    expect(resolved).toBe(join(root, "LICENSES", "Node-24-LICENSE.txt"));
+
+    // When node is in a bin/ subfolder, its installation root (parent directory) is searched:
+    const binDir = join(output, "node-install", "bin");
+    mkdirSync(binDir, { recursive: true });
+    copyFileSync(browserNodeExecutable(), join(binDir, "node.exe"));
+    const installRootLicense = join(output, "node-install", "LICENSE");
+    writeFileSync(installRootLicense, "Node License in installation root");
+    const binResolved = resolveNodeLicense(join(binDir, "node.exe"), emptyRepo);
+    expect(binResolved).toBe(installRootLicense);
+  } finally {
+    rmSync(output, { recursive: true, force: true });
+  }
+});

@@ -117,7 +117,7 @@ This source path requires Bun 1.4.0. The command installs locked dependencies an
 The source-only managed-Chrome path additionally requires Node.js 22+ on `PATH` and installed
 Google Chrome. Windows runtime bundles carry their own Node executable and license, login worker,
 and native process supervisor; installing system Node is not required for those bundles.
-Windows bundle builds require the Node distribution's `LICENSE` beside `node.exe` and the Windows
+Windows bundle builds require the Node distribution's `LICENSE` (beside `node.exe`, in its installation root, or from repository copies) and the Windows
 .NET Framework C# compiler. No runtime download or install is attempted when a browser starts.
 
 Browser helpers and their descendants belong to a Windows Job Object: closing the helper,
