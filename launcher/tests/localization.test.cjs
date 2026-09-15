@@ -12,13 +12,13 @@ const chineseReadme = read("README.zh-CN.md");
 const japaneseReadme = read("README.ja.md");
 
 function commandFences(source) {
-  return [...source.matchAll(/```(bash|powershell)\n([\s\S]*?)```/g)]
-    .map((match) => `${match[1]}\n${match[2].trim()}`);
+  return [...source.matchAll(/```(bash|powershell)\r?\n([\s\S]*?)```/g)]
+    .map((match) => `${match[1]}\n${match[2].trim().replace(/\r\n/g, "\n")}`);
 }
 
 function linkTargets(source) {
-  const markdown = [...source.matchAll(/\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g)].map((match) => match[1]);
-  const html = [...source.matchAll(/(?:href|src)="([^"]+)"/g)].map((match) => match[1]);
+  const markdown = [...source.matchAll(/\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g)].map((match) => match[1].trim());
+  const html = [...source.matchAll(/(?:href|src)="([^"]+)"/g)].map((match) => match[1].trim());
   return [...new Set([...markdown, ...html])].sort();
 }
 
