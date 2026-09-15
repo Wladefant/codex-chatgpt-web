@@ -77,7 +77,7 @@ export async function stopBrowserProcess(child: ChildProcessWithoutNullStreams, 
   if (await wait(graceMs)) return;
   // On Windows this terminates the supervisor, closing its private job handle atomically.
   child.kill("SIGKILL");
-  if (!await wait(2_000)) throw new Error("Owned browser process did not exit after forced termination");
+  if (!await wait(5_000)) throw new Error("Owned browser process did not exit after forced termination");
   child.stdout.destroy();
   child.stderr.destroy();
 }
