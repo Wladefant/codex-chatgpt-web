@@ -1,5 +1,6 @@
 import { spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
+import { freemem, totalmem } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { notifyLauncherTurn, readLauncherBrowserHostDescriptor } from "../../launcher-browser-host";
@@ -27,6 +28,7 @@ interface PendingTurn {
 
 type HelperMessage =
   | { type: "ready"; features?: string[] }
+  | { type: "heartbeat" }
   | { type: "event"; id: string; event: "heartbeat" | "send_activated" | "submitted" | "reasoning" | "commentary" | "text"; text?: string; continuation?: boolean }
   | { type: "event"; id: string; event: "tool_batch_observed"; revision: number }
   | { type: "event"; id: string; event: "multipart_stage_acknowledged"; stageIndex: number }
@@ -59,6 +61,12 @@ function parseHelperMessage(line: string): HelperMessage {
       throw new Error("Launcher browser helper advertised invalid features");
     }
     return { type: "ready", ...(features ? { features: features as string[] } : {}) };
+  }
+  if (message.type === "heartbeat") {
+    return { type: "heartbeat" };
+  }
+  if (message.type === "event" && message.event === "heartbeat" && (!message.id || typeof message.id !== "string")) {
+    return { type: "heartbeat" };
   }
   if (typeof message.id !== "string" || !message.id) {
     throw new Error("Launcher browser helper message has no turn identity");
@@ -397,10 +405,79 @@ export class LauncherBrowserHelperClient {
       this.readyResolve = resolveReady;
       this.readyReject = rejectReady;
     });
+    const hardBoundMs = this.config.helperReadyMaxTimeoutMs ?? 60_000;
+    const initialTimeoutMs = Math.min(this.config.helperReadyTimeoutMs ?? 15_000, hardBoundMs);
+
+    const startTime = Date.now();
+    let currentDeadline = startTime + initialTimeoutMs;
+    const hardDeadline = startTime + hardBoundMs;
+    let lastOutputLine: string | undefined;
+    let timer: NodeJS.Timeout | undefined;
+
+    const recordProgress = (chunkOrLine?: string) => {
+      if (this.child !== child) return;
+      if (chunkOrLine !== undefined) {
+        const trimmed = chunkOrLine.trim();
+        if (trimmed.length > 0) {
+          const lines = trimmed.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
+          if (lines.length > 0) {
+            lastOutputLine = lines[lines.length - 1]!.slice(0, 256);
+          }
+        }
+      }
+      const isAlive = child.exitCode === null && child.signalCode === null;
+      if (isAlive) {
+        currentDeadline = Math.min(Date.now() + initialTimeoutMs, hardDeadline);
+      }
+    };
+
+    const expire = (hitHardBound: boolean) => {
+      if (this.child !== child) return;
+      clearTimeout(timer);
+      const freeBytes = freemem();
+      const totalBytes = totalmem();
+      const freeMb = Math.round(freeBytes / (1024 * 1024));
+      const totalMb = Math.round(totalBytes / (1024 * 1024));
+      const freePct = totalBytes > 0 ? ((freeBytes / totalBytes) * 100).toFixed(1) : "0";
+      const boundValue = hitHardBound ? hardBoundMs : initialTimeoutMs;
+      const boundDesc = hitHardBound ? `hard upper bound of ${boundValue}ms` : `activity deadline of ${boundValue}ms`;
+      const outputDesc = lastOutputLine ? `"${lastOutputLine}"` : "<none>";
+      const diagnosis = `Launcher browser helper did not become ready within ${boundDesc} (last output: ${outputDesc}, host free RAM: ${freeMb}MB / ${totalMb}MB [${freePct}% free])`;
+      const reject = this.readyReject;
+      this.readyResolve = undefined;
+      this.readyReject = undefined;
+      reject?.(new Error(diagnosis));
+    };
+
+    const scheduleCheck = () => {
+      if (this.child !== child) return;
+      const now = Date.now();
+      if (now >= hardDeadline) {
+        expire(true);
+        return;
+      }
+      if (now >= currentDeadline) {
+        expire(false);
+        return;
+      }
+
+      const nextDelay = Math.max(10, Math.min(currentDeadline - now, hardDeadline - now));
+      timer = setTimeout(scheduleCheck, nextDelay);
+    };
+
     const output = createInterface({ input: child.stdout });
-    output.on("line", line => this.handleLine(child, line));
+    output.on("line", line => {
+      recordProgress(line);
+      this.handleLine(child, line);
+    });
     const errors = createInterface({ input: child.stderr });
-    errors.on("line", line => console.info(`[chatgpt-web-helper] ${line}`));
+    errors.on("line", line => {
+      console.info(`[chatgpt-web-helper] ${line}`);
+      recordProgress(line);
+    });
+    child.stdout.on("data", (chunk: Buffer | string) => recordProgress(chunk.toString("utf8")));
+    child.stderr.on("data", (chunk: Buffer | string) => recordProgress(chunk.toString("utf8")));
+
     const failChild = (error: Error) => {
       const owned = this.child === child;
       this.handleExit(child, error);
@@ -419,9 +496,9 @@ export class LauncherBrowserHelperClient {
     child.once("exit", (code, signal) => this.handleExit(child, new Error(
       `Launcher browser helper exited ${signal ? `from signal ${signal}` : `with status ${code ?? 1}`}`,
     )));
-    const timer = setTimeout(() => {
-      if (this.child === child) this.readyReject?.(new Error("Launcher browser helper did not become ready"));
-    }, 15_000);
+
+    timer = setTimeout(scheduleCheck, Math.max(10, Math.min(currentDeadline - startTime, hardDeadline - startTime)));
+
     try {
       await this.ready;
     } catch (error) {
@@ -449,6 +526,10 @@ export class LauncherBrowserHelperClient {
     let message: HelperMessage;
     try { message = parseHelperMessage(line); }
     catch (error) {
+      if (this.readyResolve !== undefined) {
+        console.info(`[chatgpt-web-helper] ${line}`);
+        return;
+      }
       const detail = error instanceof Error ? error.message : String(error);
       this.handleExit(child, new Error(`Launcher browser helper emitted invalid protocol data: ${detail}`));
       void this.terminateChild(child, 0).catch(error => {
@@ -459,9 +540,13 @@ export class LauncherBrowserHelperClient {
     if (message.type === "ready") {
       // Optional frames are sent only when the helper advertises support for them.
       this.helperFeatures = new Set(message.features ?? []);
-      this.readyResolve?.();
+      const resolve = this.readyResolve;
       this.readyResolve = undefined;
       this.readyReject = undefined;
+      resolve?.();
+      return;
+    }
+    if (message.type === "heartbeat") {
       return;
     }
     const pending = this.pending.get(message.id);

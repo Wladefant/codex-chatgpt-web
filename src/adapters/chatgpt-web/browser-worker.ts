@@ -1220,6 +1220,8 @@ export interface ResolvedBrowserConfig {
   storageStatePath: string;
   chromeExecutablePath: string;
   turnTimeoutMs?: number;
+  helperReadyTimeoutMs?: number;
+  helperReadyMaxTimeoutMs?: number;
   headed: boolean;
   autoApproveToolCalls: boolean;
 }
@@ -1959,6 +1961,16 @@ export function resolveBrowserConfig(provider: CodexProviderConfig): ResolvedBro
     && (!Number.isFinite(turnTimeoutMs) || turnTimeoutMs <= 0)) {
     throw new Error("ChatGPT Web turnTimeoutMs must be a positive finite number");
   }
+  const helperReadyTimeoutMs = configured.helperReadyTimeoutMs;
+  if (helperReadyTimeoutMs !== undefined
+    && (!Number.isFinite(helperReadyTimeoutMs) || helperReadyTimeoutMs <= 0)) {
+    throw new Error("ChatGPT Web helperReadyTimeoutMs must be a positive finite number");
+  }
+  const helperReadyMaxTimeoutMs = configured.helperReadyMaxTimeoutMs;
+  if (helperReadyMaxTimeoutMs !== undefined
+    && (!Number.isFinite(helperReadyMaxTimeoutMs) || helperReadyMaxTimeoutMs <= 0)) {
+    throw new Error("ChatGPT Web helperReadyMaxTimeoutMs must be a positive finite number");
+  }
   if (isLegacyChatGptConnectorName(appName)) {
     throw new Error(legacyChatGptConnectorMigrationMessage(appName));
   }
@@ -1971,6 +1983,8 @@ export function resolveBrowserConfig(provider: CodexProviderConfig): ResolvedBro
     storageStatePath: resolve(expandUserPath(configured.storageStatePath?.trim() || join(getConfigDir(), "browser", "storage-state.json"))),
     chromeExecutablePath: resolve(expandUserPath(configured.chromeExecutablePath?.trim() || defaultChromeExecutable())),
     ...(turnTimeoutMs !== undefined ? { turnTimeoutMs } : {}),
+    ...(helperReadyTimeoutMs !== undefined ? { helperReadyTimeoutMs } : {}),
+    ...(helperReadyMaxTimeoutMs !== undefined ? { helperReadyMaxTimeoutMs } : {}),
     headed: configured.headed !== false,
     autoApproveToolCalls: configured.autoApproveToolCalls === true,
   };

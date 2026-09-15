@@ -1,5 +1,5 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
@@ -11,6 +11,36 @@ const roots: string[] = [];
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
+function alive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+async function eventually(check: () => boolean, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!check()) {
+    if (Date.now() >= deadline) throw new Error("Condition not met within deadline");
+    await Bun.sleep(25);
+  }
+}
+function createLauncherDescriptor(root: string, helperScript: string): string {
+  const descriptorPath = join(root, "launcher.json");
+  writeFileSync(descriptorPath, `${JSON.stringify({
+    version: 2,
+    kind: LAUNCHER_BROWSER_HOST_KIND,
+    profile: "production",
+    pid: process.pid,
+    endpoint: "http://127.0.0.1:39001",
+    control: {
+      endpoint: "http://127.0.0.1:39002",
+      token: "launcher-control-token-0123456789abcdefghijklmnop",
+    },
+    helper: { executable: process.execPath, script: helperScript },
+    partition: "persist:codex-web-gpt-chatgpt",
+    idleUrl: LAUNCHER_BROWSER_IDLE_URL,
+    surfaceId: "launcher_surface_id_0123456789AB",
+    createdAt: new Date().toISOString(),
+  })}\n`, { mode: 0o600 });
+  return descriptorPath;
+}
 
 test("daemon streams browser lifecycle through the real helper process", async () => {
   const root = mkdtempSync(join(tmpdir(), "codex-launcher-helper-client-"));
@@ -219,7 +249,7 @@ test("accepted compaction retires through the helper as completed without hiding
     logger.mockRestore();
     await server.stop(true);
   }
-});
+}, 30_000);
 
 test("launcher helper protocol preserves multipart context and the compaction flag", async () => {
   const sent: Record<string, unknown>[] = [];
@@ -428,6 +458,268 @@ test("managed helper that stops answering rejects at its turn deadline", async (
       prepare: async () => ({ text: "inspect", images: [], release() {} }),
       onTextDelta() {},
     })).rejects.toThrow("Browser helper turn timed out after 100ms");
+  } finally {
+    await client.close();
+  }
+}, 30_000);
+
+test("slow-but-progressing child succeeds past the old deadline", async () => {
+  const root = mkdtempSync(join(tmpdir(), "slow-progressing-child-"));
+  roots.push(root);
+  const helper = join(root, "helper.cjs");
+  writeFileSync(helper, `
+    const start = Date.now();
+    const interval = setInterval(() => {
+      process.stderr.write("helper startup progressing at " + (Date.now() - start) + "ms\\n");
+      process.stdout.write(JSON.stringify({ type: "heartbeat" }) + "\\n");
+    }, 200);
+
+    setTimeout(() => {
+      clearInterval(interval);
+      process.stdout.write(JSON.stringify({ type: "ready" }) + "\\n");
+      const readline = require("node:readline");
+      const rl = readline.createInterface({ input: process.stdin });
+      rl.on("line", line => {
+        const msg = JSON.parse(line);
+        if (msg.type === "run" || msg.type === "turn") {
+          process.stdout.write(JSON.stringify({ type: "result", id: msg.id, text: "success past old deadline" }) + "\\n");
+        }
+      });
+    }, 2_500);
+  `);
+  const descriptorPath = createLauncherDescriptor(root, helper);
+  const client = new LauncherBrowserHelperClient({
+    appName: "Codex Native2",
+    browserHost: "launcher",
+    browserHostDescriptorPath: descriptorPath,
+    browserHelperScriptPath: helper,
+    storageStatePath: join(root, "unused-state.json"),
+    chromeExecutablePath: join(root, "unused-chrome"),
+    turnTimeoutMs: 10_000,
+    helperReadyTimeoutMs: 1_800,
+    helperReadyMaxTimeoutMs: 10_000,
+    headed: false,
+    autoApproveToolCalls: false,
+  });
+  try {
+    const startTime = Date.now();
+    const result = await client.run({
+      traceId: "slow-progress",
+      modelId: "gpt-5.6-sol",
+      reasoning: "low",
+      capabilities: { localToolsEnabled: false, solAvailable: true, proAvailable: false },
+      prepare: async () => ({ text: "inspect", images: [], release() {} }),
+      onTextDelta() {},
+    });
+    const elapsed = Date.now() - startTime;
+    expect(result).toBe("success past old deadline");
+    expect(elapsed).toBeGreaterThanOrEqual(2_000);
+  } finally {
+    await client.close();
+  }
+}, 30_000);
+
+test("silent child hits the activity deadline with diagnosis and is terminated", async () => {
+  const root = mkdtempSync(join(tmpdir(), "silent-child-hard-bound-"));
+  roots.push(root);
+  const helper = join(root, "helper.cjs");
+  const receipt = join(root, "receipt.json");
+  writeFileSync(helper, `
+    const fs = require("node:fs");
+    fs.writeFileSync(${JSON.stringify(receipt)}, JSON.stringify({ pid: process.pid }));
+    setInterval(() => {}, 1000);
+  `);
+  const descriptorPath = createLauncherDescriptor(root, helper);
+  const client = new LauncherBrowserHelperClient({
+    appName: "Codex Native2",
+    browserHost: "launcher",
+    browserHostDescriptorPath: descriptorPath,
+    browserHelperScriptPath: helper,
+    storageStatePath: join(root, "unused-state.json"),
+    chromeExecutablePath: join(root, "unused-chrome"),
+    turnTimeoutMs: 10_000,
+    helperReadyTimeoutMs: 1_800,
+    helperReadyMaxTimeoutMs: 5_000,
+    headed: false,
+    autoApproveToolCalls: false,
+  });
+  let childPid: number | undefined;
+  try {
+    const startTime = Date.now();
+    const runPromise = client.run({
+      traceId: "silent-child",
+      modelId: "gpt-5.6-sol",
+      reasoning: "low",
+      capabilities: { localToolsEnabled: false, solAvailable: true, proAvailable: false },
+      prepare: async () => ({ text: "inspect", images: [], release() {} }),
+      onTextDelta() {},
+    });
+    // Attach an empty rejection handler to prevent unhandled rejection during wait
+    runPromise.catch(() => {});
+
+    await eventually(() => {
+      try {
+        const parsed = JSON.parse(readFileSync(receipt, "utf8")) as { pid: number };
+        childPid = parsed.pid;
+        return typeof childPid === "number";
+      } catch { return false; }
+    });
+    expect(childPid).toBeDefined();
+    expect(alive(childPid!)).toBe(true);
+
+    let caughtError: Error | undefined;
+    try {
+      await runPromise;
+    } catch (error) {
+      caughtError = error instanceof Error ? error : new Error(String(error));
+    }
+    const elapsed = Date.now() - startTime;
+    expect(caughtError).toBeDefined();
+    expect(elapsed).toBeGreaterThanOrEqual(1_500);
+    expect(caughtError!.message).toContain("activity deadline of 1800ms");
+    expect(caughtError!.message).toContain("last output: <none>");
+    expect(caughtError!.message).toMatch(/host free RAM: \d+MB \/ \d+MB \[\d+(\.\d+)?% free\]/);
+
+    // Assert that the child process was terminated upon hitting the deadline
+    await eventually(() => !alive(childPid!), 5_000);
+    expect(alive(childPid!)).toBe(false);
+  } finally {
+    await client.close();
+  }
+}, 30_000);
+
+test("progressing child that never sends ready hits the hard bound and includes last output diagnosis", async () => {
+  const root = mkdtempSync(join(tmpdir(), "stalled-output-child-"));
+  roots.push(root);
+  const helper = join(root, "helper.cjs");
+  writeFileSync(helper, `
+    process.stderr.write("stalled after step 2: loading model\\n");
+    const interval = setInterval(() => {
+      process.stderr.write("stalled after step 2: loading model\\n");
+    }, 250);
+  `);
+  const descriptorPath = createLauncherDescriptor(root, helper);
+  const client = new LauncherBrowserHelperClient({
+    appName: "Codex Native2",
+    browserHost: "launcher",
+    browserHostDescriptorPath: descriptorPath,
+    browserHelperScriptPath: helper,
+    storageStatePath: join(root, "unused-state.json"),
+    chromeExecutablePath: join(root, "unused-chrome"),
+    turnTimeoutMs: 10_000,
+    helperReadyTimeoutMs: 1_800,
+    helperReadyMaxTimeoutMs: 4_500,
+    headed: false,
+    autoApproveToolCalls: false,
+  });
+  try {
+    let caughtError: Error | undefined;
+    try {
+      await client.run({
+        traceId: "stalled-output",
+        modelId: "gpt-5.6-sol",
+        reasoning: "low",
+        capabilities: { localToolsEnabled: false, solAvailable: true, proAvailable: false },
+        prepare: async () => ({ text: "inspect", images: [], release() {} }),
+        onTextDelta() {},
+      });
+    } catch (error) {
+      caughtError = error instanceof Error ? error : new Error(String(error));
+    }
+    expect(caughtError!.message).toContain("hard upper bound of 4500ms");
+    expect(caughtError!.message).toContain('last output: "stalled after step 2: loading model"');
+    expect(caughtError!.message).toMatch(/host free RAM: \d+MB \/ \d+MB \[\d+(\.\d+)?% free\]/);
+  } finally {
+    await client.close();
+  }
+}, 30_000);
+
+test("configured helperReadyMaxTimeoutMs caps activity deadline and is not extended when helperReadyTimeoutMs is larger", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hard-bound-not-extended-"));
+  roots.push(root);
+  const helper = join(root, "helper.cjs");
+  writeFileSync(helper, `
+    setInterval(() => {}, 1000);
+  `);
+  const descriptorPath = createLauncherDescriptor(root, helper);
+  const client = new LauncherBrowserHelperClient({
+    appName: "Codex Native2",
+    browserHost: "launcher",
+    browserHostDescriptorPath: descriptorPath,
+    browserHelperScriptPath: helper,
+    storageStatePath: join(root, "unused-state.json"),
+    chromeExecutablePath: join(root, "unused-chrome"),
+    turnTimeoutMs: 10_000,
+    helperReadyTimeoutMs: 15_000,
+    helperReadyMaxTimeoutMs: 1_000,
+    headed: false,
+    autoApproveToolCalls: false,
+  });
+  try {
+    const startTime = Date.now();
+    let caughtError: Error | undefined;
+    try {
+      await client.run({
+        traceId: "capped-deadline",
+        modelId: "gpt-5.6-sol",
+        reasoning: "low",
+        capabilities: { localToolsEnabled: false, solAvailable: true, proAvailable: false },
+        prepare: async () => ({ text: "inspect", images: [], release() {} }),
+        onTextDelta() {},
+      });
+    } catch (error) {
+      caughtError = error instanceof Error ? error : new Error(String(error));
+    }
+    const elapsed = Date.now() - startTime;
+    expect(caughtError).toBeDefined();
+    expect(elapsed).toBeLessThan(5_000);
+    expect(caughtError!.message).toContain("hard upper bound of 1000ms");
+    expect(caughtError!.message).not.toContain("15000ms");
+  } finally {
+    await client.close();
+  }
+}, 30_000);
+
+test("configured helperReadyMaxTimeoutMs caps the default 15s activity deadline when helperReadyTimeoutMs is omitted", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hard-bound-default-capped-"));
+  roots.push(root);
+  const helper = join(root, "helper.cjs");
+  writeFileSync(helper, `
+    setInterval(() => {}, 1000);
+  `);
+  const descriptorPath = createLauncherDescriptor(root, helper);
+  const client = new LauncherBrowserHelperClient({
+    appName: "Codex Native2",
+    browserHost: "launcher",
+    browserHostDescriptorPath: descriptorPath,
+    browserHelperScriptPath: helper,
+    storageStatePath: join(root, "unused-state.json"),
+    chromeExecutablePath: join(root, "unused-chrome"),
+    turnTimeoutMs: 10_000,
+    helperReadyMaxTimeoutMs: 1_000,
+    headed: false,
+    autoApproveToolCalls: false,
+  });
+  try {
+    const startTime = Date.now();
+    let caughtError: Error | undefined;
+    try {
+      await client.run({
+        traceId: "default-capped-deadline",
+        modelId: "gpt-5.6-sol",
+        reasoning: "low",
+        capabilities: { localToolsEnabled: false, solAvailable: true, proAvailable: false },
+        prepare: async () => ({ text: "inspect", images: [], release() {} }),
+        onTextDelta() {},
+      });
+    } catch (error) {
+      caughtError = error instanceof Error ? error : new Error(String(error));
+    }
+    const elapsed = Date.now() - startTime;
+    expect(caughtError).toBeDefined();
+    expect(elapsed).toBeLessThan(5_000);
+    expect(caughtError!.message).toContain("hard upper bound of 1000ms");
+    expect(caughtError!.message).not.toContain("15000ms");
   } finally {
     await client.close();
   }
