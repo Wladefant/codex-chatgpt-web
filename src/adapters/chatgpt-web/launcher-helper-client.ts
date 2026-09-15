@@ -405,13 +405,12 @@ export class LauncherBrowserHelperClient {
       this.readyResolve = resolveReady;
       this.readyReject = rejectReady;
     });
-    const initialTimeoutMs = this.config.helperReadyTimeoutMs ?? 15_000;
     const hardBoundMs = this.config.helperReadyMaxTimeoutMs ?? 60_000;
-    const effectiveHardBoundMs = Math.max(initialTimeoutMs, hardBoundMs);
+    const initialTimeoutMs = Math.min(this.config.helperReadyTimeoutMs ?? 15_000, hardBoundMs);
 
     const startTime = Date.now();
     let currentDeadline = startTime + initialTimeoutMs;
-    const hardDeadline = startTime + effectiveHardBoundMs;
+    const hardDeadline = startTime + hardBoundMs;
     let lastOutputLine: string | undefined;
     let timer: NodeJS.Timeout | undefined;
 
@@ -440,7 +439,7 @@ export class LauncherBrowserHelperClient {
       const freeMb = Math.round(freeBytes / (1024 * 1024));
       const totalMb = Math.round(totalBytes / (1024 * 1024));
       const freePct = totalBytes > 0 ? ((freeBytes / totalBytes) * 100).toFixed(1) : "0";
-      const boundValue = hitHardBound ? effectiveHardBoundMs : initialTimeoutMs;
+      const boundValue = hitHardBound ? hardBoundMs : initialTimeoutMs;
       const boundDesc = hitHardBound ? `hard upper bound of ${boundValue}ms` : `activity deadline of ${boundValue}ms`;
       const outputDesc = lastOutputLine ? `"${lastOutputLine}"` : "<none>";
       const diagnosis = `Launcher browser helper did not become ready within ${boundDesc} (last output: ${outputDesc}, host free RAM: ${freeMb}MB / ${totalMb}MB [${freePct}% free])`;

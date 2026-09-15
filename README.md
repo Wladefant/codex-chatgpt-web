@@ -124,7 +124,7 @@ Browser helpers and their descendants belong to a Windows Job Object: closing th
 its supervisor, or the owning daemon terminates the whole owned tree. The login worker has a
 60-second execution deadline by default (an explicit login timeout overrides it), and interactive
 login has a ten-minute default deadline. Helper turns use their configured deadline or a
-30-minute transport ceiling; stalled shutdown is forcefully bounded to two seconds.
+30-minute transport ceiling; stalled shutdown is forcefully bounded to five seconds.
 Background login verification is headless, with no automatic headed fallback. Login extraction
 opens the owned profile only after the login browser closes; it neither copies the profile nor
 removes another process's locks. Browser identity uses the running Chrome version, not Chrome 134.

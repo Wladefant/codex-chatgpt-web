@@ -633,3 +633,94 @@ test("progressing child that never sends ready hits the hard bound and includes 
     await client.close();
   }
 }, 30_000);
+
+test("configured helperReadyMaxTimeoutMs caps activity deadline and is not extended when helperReadyTimeoutMs is larger", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hard-bound-not-extended-"));
+  roots.push(root);
+  const helper = join(root, "helper.cjs");
+  writeFileSync(helper, `
+    setInterval(() => {}, 1000);
+  `);
+  const descriptorPath = createLauncherDescriptor(root, helper);
+  const client = new LauncherBrowserHelperClient({
+    appName: "Codex Native2",
+    browserHost: "launcher",
+    browserHostDescriptorPath: descriptorPath,
+    browserHelperScriptPath: helper,
+    storageStatePath: join(root, "unused-state.json"),
+    chromeExecutablePath: join(root, "unused-chrome"),
+    turnTimeoutMs: 10_000,
+    helperReadyTimeoutMs: 15_000,
+    helperReadyMaxTimeoutMs: 1_000,
+    headed: false,
+    autoApproveToolCalls: false,
+  });
+  try {
+    const startTime = Date.now();
+    let caughtError: Error | undefined;
+    try {
+      await client.run({
+        traceId: "capped-deadline",
+        modelId: "gpt-5.6-sol",
+        reasoning: "low",
+        capabilities: { localToolsEnabled: false, solAvailable: true, proAvailable: false },
+        prepare: async () => ({ text: "inspect", images: [], release() {} }),
+        onTextDelta() {},
+      });
+    } catch (error) {
+      caughtError = error instanceof Error ? error : new Error(String(error));
+    }
+    const elapsed = Date.now() - startTime;
+    expect(caughtError).toBeDefined();
+    expect(elapsed).toBeLessThan(5_000);
+    expect(caughtError!.message).toContain("hard upper bound of 1000ms");
+    expect(caughtError!.message).not.toContain("15000ms");
+  } finally {
+    await client.close();
+  }
+}, 30_000);
+
+test("configured helperReadyMaxTimeoutMs caps the default 15s activity deadline when helperReadyTimeoutMs is omitted", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hard-bound-default-capped-"));
+  roots.push(root);
+  const helper = join(root, "helper.cjs");
+  writeFileSync(helper, `
+    setInterval(() => {}, 1000);
+  `);
+  const descriptorPath = createLauncherDescriptor(root, helper);
+  const client = new LauncherBrowserHelperClient({
+    appName: "Codex Native2",
+    browserHost: "launcher",
+    browserHostDescriptorPath: descriptorPath,
+    browserHelperScriptPath: helper,
+    storageStatePath: join(root, "unused-state.json"),
+    chromeExecutablePath: join(root, "unused-chrome"),
+    turnTimeoutMs: 10_000,
+    helperReadyMaxTimeoutMs: 1_000,
+    headed: false,
+    autoApproveToolCalls: false,
+  });
+  try {
+    const startTime = Date.now();
+    let caughtError: Error | undefined;
+    try {
+      await client.run({
+        traceId: "default-capped-deadline",
+        modelId: "gpt-5.6-sol",
+        reasoning: "low",
+        capabilities: { localToolsEnabled: false, solAvailable: true, proAvailable: false },
+        prepare: async () => ({ text: "inspect", images: [], release() {} }),
+        onTextDelta() {},
+      });
+    } catch (error) {
+      caughtError = error instanceof Error ? error : new Error(String(error));
+    }
+    const elapsed = Date.now() - startTime;
+    expect(caughtError).toBeDefined();
+    expect(elapsed).toBeLessThan(5_000);
+    expect(caughtError!.message).toContain("hard upper bound of 1000ms");
+    expect(caughtError!.message).not.toContain("15000ms");
+  } finally {
+    await client.close();
+  }
+}, 30_000);
