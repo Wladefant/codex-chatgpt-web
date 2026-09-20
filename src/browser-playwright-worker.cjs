@@ -5,6 +5,9 @@ const CHATGPT_COMPOSER_SELECTOR = [
   '[data-testid="prompt-textarea"]',
   "#prompt-textarea",
   '[contenteditable="true"][data-lexical-editor="true"]',
+  '.ProseMirror[contenteditable="true"]',
+  '[contenteditable="true"][data-composer-markdown]',
+  '[contenteditable="true"][role="textbox"]',
 ].join(", ");
 const CHATGPT_EFFORT_CONTROL_SELECTOR = [
   'button[aria-haspopup="menu"][data-tone="neutral"]',

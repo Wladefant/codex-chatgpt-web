@@ -9,6 +9,7 @@ import { runBrowserWorker, spawnBrowserProcess, stopBrowserProcess } from "./bro
 import {
   assertAuthenticatedChatGptPage,
   assertTemporaryChatPage,
+  CHATGPT_COMPOSER_SELECTOR,
   CHATGPT_TEMPORARY_CHAT_URL,
   detectChatGptAccountCapabilities,
 } from "./chatgpt-session";
@@ -218,7 +219,7 @@ async function extractAndVerifyState(
     const page = context.pages()[0] ?? await context.newPage();
     await page.goto(CHATGPT_TEMPORARY_CHAT_URL, { waitUntil: "domcontentloaded", timeout: 60_000 });
     const composer = page.getByRole("textbox", { name: "Chat with ChatGPT" }).or(
-      page.locator('[data-testid="prompt-textarea"], [contenteditable="true"][data-lexical-editor="true"]'),
+      page.locator(CHATGPT_COMPOSER_SELECTOR),
     ).first();
     await composer.waitFor({ state: "visible", timeout: timeoutMs ?? 60_000 });
     await assertAuthenticatedChatGptPage(page);
