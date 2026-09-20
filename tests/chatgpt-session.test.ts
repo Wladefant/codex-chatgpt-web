@@ -5,6 +5,8 @@ import {
   CHATGPT_EFFORT_CONTROL_SELECTOR,
   CHATGPT_EFFORT_MENU_SELECTOR,
   CHATGPT_EFFORT_SLIDER_CONTAINER_SELECTOR,
+  CHATGPT_SEND_BUTTON_SELECTOR,
+  CHATGPT_STOP_BUTTON_SELECTOR,
   activateChatGptEffortMenu,
   detectChatGptAccountCapabilities,
 } from "../src/chatgpt-session";
@@ -18,12 +20,28 @@ test("composer and effort selectors exclude unrelated editable fields and menu b
     <div data-testid="prompt-textarea" id="composer-testid"></div>
     <div id="prompt-textarea"></div>
     <div contenteditable="true" data-lexical-editor="true" id="composer-lexical"></div>
+    <div contenteditable="true" class="ProseMirror" id="composer-prosemirror"></div>
+    <div contenteditable="true" data-composer-markdown="" id="composer-markdown"></div>
+    <div contenteditable="true" role="textbox" id="composer-textbox"></div>
     <button aria-haspopup="menu" data-tone="neutral" id="effort"></button>
     <button aria-haspopup="menu" data-testid="model-switcher-dropdown-button" id="model"></button>
+    <button data-testid="send-button" id="send-testid"></button>
+    <button aria-label="Send" id="send-aria"></button>
+    <button data-testid="stop-button" id="stop-testid"></button>
+    <button aria-label="Stop generating" id="stop-aria"></button>
   </form></body>`);
   const matches = (selector: string) => Array.from(document.querySelectorAll(selector)).map(element => element.id);
-  expect(matches(CHATGPT_COMPOSER_SELECTOR)).toEqual(["composer-testid", "prompt-textarea", "composer-lexical"]);
+  expect(matches(CHATGPT_COMPOSER_SELECTOR)).toEqual([
+    "composer-testid",
+    "prompt-textarea",
+    "composer-lexical",
+    "composer-prosemirror",
+    "composer-markdown",
+    "composer-textbox",
+  ]);
   expect(matches(CHATGPT_EFFORT_CONTROL_SELECTOR)).toEqual(["effort", "model"]);
+  expect(matches(CHATGPT_SEND_BUTTON_SELECTOR)).toEqual(["send-testid", "send-aria"]);
+  expect(matches(CHATGPT_STOP_BUTTON_SELECTOR)).toEqual(["stop-testid", "stop-aria"]);
 });
 
 test("effort activation binds the owned menu after the control opens", async () => {
