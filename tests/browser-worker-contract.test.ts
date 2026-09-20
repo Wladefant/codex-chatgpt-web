@@ -3,9 +3,9 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createContext, runInContext } from "node:vm";
-import type { Page } from "playwright-core";
+import type { Locator, Page } from "playwright-core";
 import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPLETION_SETTLE_MS, CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS, CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS, ChatGptCompletionTracker, chatGptExternalProgressSuppressesDomHealth, CHATGPT_RESPONSE_DOM_GRACE_MS, MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_COMPOSER_SELECT_ALL_KEY, CHATGPT_STOPPED_THINKING_GRACE_MS, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptPromptAttachmentIntegrityError, ChatGptStoppedThinkingTracker, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCheckpoint, chatGptConnectorAttachmentMode, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptSubmissionEvidence, connectAfterClosingBrowserConnection, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, sanitizeChatGptBrowserDiagnosticState, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout, CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS, browserStageTimeouts, ChatGptSuspensionClock, remainingStageBudgetMs } from "../src/adapters/chatgpt-web/browser-worker";
-import { ensureChatGptPersonalizedConnectorAccess } from "../src/adapters/chatgpt-web/browser-worker";
+import { assertChatGptResponseTurnGone, CHATGPT_RESPONSE_DOM_PROBE_TIMEOUT_MS, ensureChatGptPersonalizedConnectorAccess } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptStoppedThinkingError } from "../src/adapters/chatgpt-web/adapter-error";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
 import { CHATGPT_CONNECTOR_NAME, DEV_CHATGPT_CONNECTOR_NAME, defaultChromeExecutable, legacyChatGptConnectorMigrationMessage } from "../src/config";
@@ -921,6 +921,36 @@ test("closing the launcher page is an immediate terminal turn error", async () =
     retryable: false,
   });
   expect((error as Error).message).toContain("turn was cancelled");
+});
+
+test("an unreadable response probe is reported, never reported as an absent response", async () => {
+  // veyyon#34: a probe that ran out of budget while the page rendered was turned into "no response
+  // DOM". The turn then streamed nothing and waited for the client's idle deadline, because the
+  // missing-response grace restarted on every retry. Only a turn root that is genuinely gone is
+  // absence; anything else must surface as an unobserved page.
+  const live = {
+    page: () => ({ isClosed: () => false }),
+    count: async () => 1,
+  } as unknown as Locator; // Test seam: only page() and count() are exercised.
+  const unreadable = await assertChatGptResponseTurnGone(live, new Error("probe budget exhausted"))
+    .then(() => undefined, (cause: unknown) => cause);
+  expect(unreadable).toBeInstanceOf(ChatGptBrowserObservationTimeoutError);
+  expect((unreadable as Error).message).toContain(`${CHATGPT_RESPONSE_DOM_PROBE_TIMEOUT_MS}ms`);
+  expect((unreadable as Error).cause).toMatchObject({ message: "probe budget exhausted" });
+
+  const vanished = {
+    page: () => ({ isClosed: () => false }),
+    count: async () => 0,
+  } as unknown as Locator; // Test seam: only page() and count() are exercised.
+  expect(await assertChatGptResponseTurnGone(vanished, new Error("node detached"))).toBeUndefined();
+
+  const closed = {
+    page: () => ({ isClosed: () => true }),
+    count: async () => 1,
+  } as unknown as Locator; // Test seam: only page() and count() are exercised.
+  const cancelled = await assertChatGptResponseTurnGone(closed, new Error("target closed"))
+    .then(() => undefined, (cause: unknown) => cause);
+  expect(cancelled).toMatchObject({ status: 499, retryable: false });
 });
 
 test("active composer resolution waits for exactly one visible editor", async () => {
@@ -3356,15 +3386,27 @@ test("browser DOM health fails closed on a vanished or empty ChatGPT response", 
   expect(empty.update(terminal, 1_000)).toBeUndefined();
   expect(empty.update(terminal, 1_500)).toContain("completed without a final answer");
 
-  const missingCompletionAction = new ChatGptTurnDomHealthTracker(1_000, 500, 750);
+  // A quiescent answer whose completion action never mounted is not a DOM failure: the completion
+  // tracker settles it on the quiescence window instead of holding the turn until the client's
+  // idle deadline (veyyon#34).
+  const missingCompletionAction = new ChatGptTurnDomHealthTracker(1_000, 500);
   const completedWithoutMarker = {
     ...terminal,
     currentText: "complete answer",
     completionActionVisible: false,
   };
   expect(missingCompletionAction.update(completedWithoutMarker, 1_000)).toBeUndefined();
-  expect(missingCompletionAction.update(completedWithoutMarker, 1_749)).toBeUndefined();
-  expect(missingCompletionAction.update(completedWithoutMarker, 1_750)).toContain("DOM may have changed");
+  expect(missingCompletionAction.update(completedWithoutMarker, 120_000)).toBeUndefined();
+
+  const settling = new ChatGptCompletionTracker(2_000, 60_000, 12_000);
+  expect(settling.update(completedWithoutMarker, 1_000)).toBe(false);
+  expect(settling.update(completedWithoutMarker, 12_999)).toBe(false);
+  expect(settling.update(completedWithoutMarker, 13_000)).toBe(true);
+
+  // ChatGPT's own action row, when it does mount, still settles the turn on the short window.
+  const marked = new ChatGptCompletionTracker(2_000, 60_000, 12_000);
+  expect(marked.update({ ...completedWithoutMarker, completionActionVisible: true }, 1_000)).toBe(false);
+  expect(marked.update({ ...completedWithoutMarker, completionActionVisible: true }, 3_000)).toBe(true);
 });
 
 test("stalled-turn diagnostics record DOM metrics without response or overlay content", () => {
@@ -3476,9 +3518,10 @@ test("turn cancellation heuristics defer to proven MCP progress in both wait loo
 });
 
 test("proven MCP progress vetoes every terminal DOM conclusion, not just a missing response", () => {
-  // Tool activity remains authoritative when the response DOM is present but its completion action
-  // has not appeared yet.
-  const stalled = new ChatGptTurnDomHealthTracker(1_000, 500, 750);
+  // A quiescent answer with no completion action now completes on the quiescence window, so the
+  // veto that owns it is the completion tracker's: an in-flight tool call proves more output is
+  // coming, whatever the rendered message currently looks like.
+  const quiescent = new ChatGptCompletionTracker(500, 60_000, 750);
   const answeredWithoutCompletionAction = {
     responsePresent: true,
     running: false,
@@ -3486,15 +3529,15 @@ test("proven MCP progress vetoes every terminal DOM conclusion, not just a missi
     completionActionVisible: false,
   };
 
-  expect(stalled.update({ ...answeredWithoutCompletionAction, externalProgressLive: true }, 1_000)).toBeUndefined();
-  expect(stalled.update({ ...answeredWithoutCompletionAction, externalProgressLive: true }, 10_000)).toBeUndefined();
+  expect(quiescent.update({ ...answeredWithoutCompletionAction, externalToolCallsInFlight: true }, 1_000)).toBe(false);
+  expect(quiescent.update({ ...answeredWithoutCompletionAction, externalToolCallsInFlight: true }, 10_000)).toBe(false);
 
   // Once the model genuinely stops, the window starts fresh rather than charging the live stretch.
-  expect(stalled.update(answeredWithoutCompletionAction, 10_100)).toBeUndefined();
-  expect(stalled.update(answeredWithoutCompletionAction, 10_849)).toBeUndefined();
-  expect(stalled.update(answeredWithoutCompletionAction, 10_850)).toContain("did not expose its completed-turn action");
+  expect(quiescent.update(answeredWithoutCompletionAction, 10_100)).toBe(false);
+  expect(quiescent.update(answeredWithoutCompletionAction, 10_849)).toBe(false);
+  expect(quiescent.update(answeredWithoutCompletionAction, 10_850)).toBe(true);
 
-  const empty = new ChatGptTurnDomHealthTracker(1_000, 500, 750);
+  const empty = new ChatGptTurnDomHealthTracker(1_000, 500);
   const completedEmpty = {
     responsePresent: true,
     running: false,
