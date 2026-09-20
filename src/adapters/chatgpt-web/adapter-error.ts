@@ -72,3 +72,21 @@ export function chatGptRetainedConversationUnavailableError(): ChatGptWebAdapter
     },
   );
 }
+
+/**
+ * The message was accepted but the response DOM could not be read.
+ *
+ * A probe that runs out of budget proves nothing about the turn, so it must never be reported as an
+ * absent response: that is how a rendering page became a silent turn that streamed nothing and
+ * waited for the client's idle deadline (veyyon#34). Retryable, because the page is usually
+ * observable again on the next attempt.
+ */
+export function chatGptResponseUnobservableError(message: string, cause?: unknown): ChatGptWebAdapterError {
+  return new ChatGptWebAdapterError(message, {
+    status: 503,
+    errorType: "server_error",
+    code: "browser_dom_unobservable",
+    retryable: true,
+    cause,
+  });
+}

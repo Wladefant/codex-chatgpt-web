@@ -79,6 +79,7 @@ import {
   ChatGptWebAdapterError,
   chatGptBrowserTabClosedError,
   chatGptRetainedConversationUnavailableError,
+  chatGptResponseUnobservableError,
   chatGptStoppedThinkingError,
 } from "./adapter-error";
 import {
@@ -121,6 +122,18 @@ export const CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS = 180_000;
 export const CHATGPT_EMPTY_RESPONSE_GRACE_MS = 10_000;
 export const CHATGPT_COMPLETION_ACTION_GRACE_MS = 60_000;
 export const CHATGPT_COMPLETION_SETTLE_MS = 2_000;
+/**
+ * How long an assistant message may stay byte-identical, with generation stopped, before the turn
+ * counts as complete without ChatGPT's copy/feedback action row.
+ *
+ * That action row was the only completion evidence a turn would accept, so a render that never
+ * mounted it left a finished answer sitting in the page until the client's idle deadline
+ * (veyyon#34). Generation stopped plus a quiescent message node is the same fact the action row
+ * reports, observed directly instead of through a decoration.
+ */
+export const CHATGPT_COMPLETION_QUIESCENCE_MS = 12_000;
+/** How often a turn still missing completion evidence reports what it is waiting for. */
+export const CHATGPT_RESPONSE_STALL_REPORT_INTERVAL_MS = 60_000;
 export const CHATGPT_TOOL_CONFIRMATION_TIMEOUT_MS = 60_000;
 export const MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS = 3;
 const CHATGPT_CONNECTOR_MENTION_QUERY = "@codex";
@@ -1056,10 +1069,21 @@ export function remainingStageBudgetMs(
 
 export const CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS = 5_000;
 export const MAX_CHATGPT_BROWSER_PAGE_REBINDS = 2;
+/**
+ * Budget for one response-DOM snapshot probe. Matches the general observation budget: the 2s this
+ * probe used to allow was routinely exceeded while a large turn rendered on a loaded host, and the
+ * expiry was reported as "no response DOM" (veyyon#34).
+ */
+export const CHATGPT_RESPONSE_DOM_PROBE_TIMEOUT_MS = CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS;
+/** Consecutive unreadable response-DOM probes tolerated before the turn is failed as retryable. */
+export const MAX_CHATGPT_RESPONSE_OBSERVATION_TIMEOUTS = 12;
 
 export class ChatGptBrowserObservationTimeoutError extends Error {
-  constructor(timeoutMs: number) {
-    super(`ChatGPT browser DOM observation did not respond within ${timeoutMs}ms`);
+  constructor(timeoutMs: number, options?: { cause?: unknown }) {
+    super(
+      `ChatGPT browser DOM observation did not respond within ${timeoutMs}ms`,
+      options?.cause === undefined ? undefined : { cause: options.cause },
+    );
     this.name = "ChatGptBrowserObservationTimeoutError";
   }
 }
@@ -1226,6 +1250,21 @@ export interface ResolvedBrowserConfig {
   autoApproveToolCalls: boolean;
 }
 
+/**
+ * Generation has stopped and the assistant message carries text.
+ *
+ * This is completion evidence that does not depend on ChatGPT mounting its copy/feedback row, which
+ * some renders never do. Weaker than {@link chatGptTurnIsComplete} on its own, so a turn accepted on
+ * this alone must first hold the message byte-identical for CHATGPT_COMPLETION_QUIESCENCE_MS.
+ */
+export function chatGptTurnGenerationSettled(state: {
+  responsePresent: boolean;
+  running: boolean;
+  currentText: string;
+}): boolean {
+  return state.responsePresent && !state.running && state.currentText.length > 0;
+}
+
 export function chatGptTurnIsComplete(state: {
   responsePresent: boolean;
   running: boolean;
@@ -1374,6 +1413,7 @@ export class ChatGptCompletionTracker {
   constructor(
     private readonly stableMs = CHATGPT_COMPLETION_SETTLE_MS,
     private readonly missingPostToolAnswerMs = CHATGPT_COMPLETION_ACTION_GRACE_MS,
+    private readonly quiescenceMs = CHATGPT_COMPLETION_QUIESCENCE_MS,
   ) {}
 
   needsToolBatchObservation(revision: number): boolean {
@@ -1422,7 +1462,7 @@ export class ChatGptCompletionTracker {
       return false;
     }
     this.missingPostToolAnswerSince = undefined;
-    if (!chatGptTurnIsComplete(state)) {
+    if (!chatGptTurnGenerationSettled(state)) {
       this.candidate = undefined;
       return false;
     }
@@ -1430,7 +1470,12 @@ export class ChatGptCompletionTracker {
       this.candidate = { signature, since: now };
       return false;
     }
-    return now - this.candidate.since >= this.stableMs;
+    // ChatGPT mounts its completed-turn action row within a couple of seconds, so its presence
+    // settles the turn immediately. Its absence is not evidence of more output: a quiescent message
+    // node with generation stopped completes on the longer window rather than being held for the
+    // client's idle deadline (veyyon#34).
+    const settleMs = chatGptTurnIsComplete(state) ? this.stableMs : this.quiescenceMs;
+    return now - this.candidate.since >= settleMs;
   }
 }
 
@@ -1438,12 +1483,10 @@ export class ChatGptTurnDomHealthTracker {
   private sawResponse = false;
   private missingResponseSince?: number;
   private emptyCompletionSince?: number;
-  private missingCompletionAction?: { text: string; since: number };
 
   constructor(
     private readonly missingResponseMs = CHATGPT_RESPONSE_DOM_GRACE_MS,
     private readonly emptyCompletionMs = CHATGPT_EMPTY_RESPONSE_GRACE_MS,
-    private readonly missingCompletionActionMs = CHATGPT_COMPLETION_ACTION_GRACE_MS,
   ) {}
 
   /**
@@ -1471,7 +1514,6 @@ export class ChatGptTurnDomHealthTracker {
       // no window may accrue while the model is provably working.
       this.missingResponseSince = undefined;
       this.emptyCompletionSince = undefined;
-      this.missingCompletionAction = undefined;
       return undefined;
     }
     if (state.responsePresent) {
@@ -1496,18 +1538,6 @@ export class ChatGptTurnDomHealthTracker {
       if (now - this.emptyCompletionSince >= this.emptyCompletionMs) {
         return "ChatGPT browser turn completed without a final answer";
       }
-    }
-
-    const missingCompletionAction = state.responsePresent
-      && !state.running
-      && state.currentText.length > 0
-      && !state.completionActionVisible;
-    if (!missingCompletionAction) {
-      this.missingCompletionAction = undefined;
-    } else if (this.missingCompletionAction?.text !== state.currentText) {
-      this.missingCompletionAction = { text: state.currentText, since: now };
-    } else if (now - this.missingCompletionAction.since >= this.missingCompletionActionMs) {
-      return "ChatGPT stopped generating but did not expose its completed-turn action; the ChatGPT DOM may have changed";
     }
     return undefined;
   }
@@ -1622,6 +1652,23 @@ const absentResponseDomSnapshot = (): ChatGptResponseDomSnapshot => ({
   stoppedThinkingVisible: false,
   traceBlocks: [],
 });
+
+/**
+ * Decides what a failed response-DOM probe proves: nothing, unless the turn root is really gone.
+ *
+ * A probe that exhausts its budget on a page still rendering a large turn used to be reported as an
+ * absent response. The turn then streamed nothing, and because a response had already been seen the
+ * missing-response grace restarted on every retry, so the browser waited silently until the client's
+ * idle deadline (veyyon#34). Absence must be observed, never assumed.
+ */
+export async function assertChatGptResponseTurnGone(responseTurn: Locator, error: unknown): Promise<void> {
+  if (responseTurn.page().isClosed()) {
+    throw chatGptBrowserTabClosedError();
+  }
+  const roots = await withChatGptBrowserObservationTimeout(responseTurn.count()).catch(() => 1);
+  if (roots === 0) return;
+  throw new ChatGptBrowserObservationTimeoutError(CHATGPT_RESPONSE_DOM_PROBE_TIMEOUT_MS, { cause: error });
+}
 
 /** Convert the public ChatGPT turn DOM into append-only Codex reasoning summaries. */
 export class ChatGptVisibleTraceTracker {
@@ -4138,11 +4185,12 @@ export class ChatGptBrowserWorker {
       completionActionSelector: CHATGPT_COMPLETION_ACTION_SELECTOR,
       knownKey: cache?.key,
       attributeFilter: [...CHATGPT_DOM_REVISION_ATTRIBUTES],
-    }, { timeout: 2_000 }).catch(() => undefined);
+    }, { timeout: CHATGPT_RESPONSE_DOM_PROBE_TIMEOUT_MS })
+      .catch(async (error: unknown): Promise<undefined> => {
+        await assertChatGptResponseTurnGone(responseTurn, error);
+        return undefined;
+      });
     if (!observed) {
-      if (responseTurn.page().isClosed()) {
-        throw chatGptBrowserTabClosedError();
-      }
       return absentResponseDomSnapshot();
     }
     const snapshot = observed.snapshot ?? cache?.snapshot ?? absentResponseDomSnapshot();
@@ -4777,7 +4825,7 @@ export class ChatGptBrowserWorker {
       let lastHeartbeat = 0;
       let finalText = "";
       let sawRunning = false;
-      let loggedCompletionWait = false;
+      let lastStallReportAt = 0;
       let capturedResponse = false;
       const sentAt = Date.now();
       const visibleTrace = new ChatGptVisibleTraceTracker();
@@ -4808,6 +4856,7 @@ export class ChatGptBrowserWorker {
       const responseDomCache: ChatGptResponseDomCache = {};
       let consecutiveObservationRebinds = 0;
       let internalObservationFaults = 0;
+      let responseObservationTimeouts = 0;
       let observedThisIteration = false;
       let completionFenceRevision: number | undefined;
       for (;;) {
@@ -4893,6 +4942,7 @@ export class ChatGptBrowserWorker {
         // The page was read successfully, so the fault budget is genuinely consecutive even when
         // this iteration goes on to `continue` for a rebind, confirmation, or liveness pause.
         internalObservationFaults = 0;
+        responseObservationTimeouts = 0;
         observedThisIteration = true;
         // Liveness may postpone a verdict, never waive it: once activity goes stale the DOM alone
         // decides, so a tool call that never returns cannot hold a turn with no explicit deadline open forever.
@@ -5012,16 +5062,6 @@ export class ChatGptBrowserWorker {
             }
             break;
           }
-          if (!loggedCompletionWait && Date.now() - sentAt >= 60_000) {
-            loggedCompletionWait = true;
-            await diagnostics.capture(page, "response-stalled-60s");
-            const diagnostic = await this.stalledTurnDiagnostic(page, responseTurn.locator).catch(error => JSON.stringify({
-              diagnosticError: error instanceof Error ? error.message : String(error),
-            }));
-            console.warn(
-              `[chatgpt-web] waiting for completed-turn evidence (running=${running}, sawRunning=${sawRunning}, textChars=${snapshot.visibleText.length}, completionActionVisible=${snapshot.completionActionVisible}, ui=${diagnostic})`,
-            );
-          }
         } else {
           const domError = domHealthTracker.update({
             responsePresent: false,
@@ -5032,6 +5072,26 @@ export class ChatGptBrowserWorker {
           });
           if (domError) throw new Error(domError);
         }
+        const waitingMs = Date.now() - sentAt;
+        // Report for as long as the turn waits, and whether or not a response DOM is present. The
+        // single 60s report meant a turn that kept waiting left no further trace of what it was
+        // missing, which is why the 7-minute stall could only be read from the client side
+        // (veyyon#34).
+        if (waitingMs >= CHATGPT_RESPONSE_STALL_REPORT_INTERVAL_MS
+          && Date.now() - lastStallReportAt >= CHATGPT_RESPONSE_STALL_REPORT_INTERVAL_MS) {
+          lastStallReportAt = Date.now();
+          const waitingSec = Math.round(waitingMs / 1000);
+          await diagnostics.capture(page, `response-stalled-${waitingSec}s`);
+          const diagnostic = await this.stalledTurnDiagnostic(page, responseTurn.locator).catch(error => JSON.stringify({
+            diagnosticError: error instanceof Error ? error.message : String(error),
+          }));
+          console.warn(
+            `[chatgpt-web] browser turn ${turn.traceId} waiting ${waitingSec}s for completed-turn evidence`
+            + ` (responsePresent=${snapshot.responsePresent}, running=${running}, sawRunning=${sawRunning}`
+            + `, textChars=${snapshot.visibleText.length}, completionActionVisible=${snapshot.completionActionVisible}`
+            + `, ui=${diagnostic})`,
+          );
+        }
         await new Promise(resolveSleep => setTimeout(resolveSleep, 250));
        } catch (error) {
         // Only a defect in this worker is retried here. Every deliberate signal — adapter errors,
@@ -5039,6 +5099,28 @@ export class ChatGptBrowserWorker {
         // Retry only faults raised while reading the page. Once observation succeeded, a
         // TypeError belongs to a consumer - Markdown buffering, text/trace callbacks, checkpoint
         // capture - and retrying it would rerun an iteration whose side effects already happened.
+        if (error instanceof ChatGptBrowserObservationTimeoutError) {
+          // The page could not be read. That is not evidence about the turn, so it is retried on a
+          // bounded budget and then reported as a retryable failure; the alternative was reporting
+          // an absent response and waiting for the client's deadline (veyyon#34).
+          responseObservationTimeouts += 1;
+          if (responseObservationTimeouts > MAX_CHATGPT_RESPONSE_OBSERVATION_TIMEOUTS) {
+            await diagnostics.capture(page, "response-dom-unobservable");
+            throw chatGptResponseUnobservableError(
+              `ChatGPT accepted the message but its response DOM could not be read`
+              + ` ${responseObservationTimeouts} times in a row`,
+              error,
+            );
+          }
+          console.warn(
+            `[chatgpt-web] browser turn ${turn.traceId} tolerated unreadable response DOM`
+            + ` ${responseObservationTimeouts}/${MAX_CHATGPT_RESPONSE_OBSERVATION_TIMEOUTS}: ${error.message}`,
+          );
+          responseDomCache.key = undefined;
+          responseDomCache.snapshot = undefined;
+          await new Promise(resolveSleep => setTimeout(resolveSleep, 250));
+          continue;
+        }
         if (!(error instanceof TypeError) || observedThisIteration) throw error;
         internalObservationFaults += 1;
         if (internalObservationFaults > MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS) {
