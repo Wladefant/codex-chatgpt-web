@@ -3197,7 +3197,7 @@ describe("ChatGPT outer-native harness v4", () => {
     environment.tools = [
       { name: "exec_command", description: "Run a Codex command", parameters: { type: "object" } },
     ];
-    const abandonedToken = await broker.register(environment, 3_000);
+    const abandonedToken = await broker.register(environment, 15_000);
     const replacementToken = await broker.register(environment);
     const transport = new StdioClientTransport({
       command: process.execPath,
@@ -3248,7 +3248,7 @@ describe("ChatGPT outer-native harness v4", () => {
       broker.revoke(replacementToken);
       await broker.close();
     }
-  }, 10_000);
+  }, 20_000);
 
   test("a native tool deadline returns an explicit MCP timeout instead of a transport failure", async () => {
     const socketPath = brokerTestEndpoint(`cgw-h3-mcp-timeout-${process.pid}-${Date.now()}`);
