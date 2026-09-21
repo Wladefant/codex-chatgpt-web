@@ -10,6 +10,7 @@ import {
   CHATGPT_STOP_BUTTON_SELECTOR,
   CHATGPT_USER_TURN_SELECTOR,
   activateChatGptEffortMenu,
+  chatGptTurnLocatorSelector,
   detectChatGptAccountCapabilities,
 } from "../src/chatgpt-session";
 
@@ -488,4 +489,25 @@ test("turn selectors retain backward compatibility with legacy conversation-turn
 
   expect(userMatches).toEqual(["legacy-user-1", "legacy-user-2", "legacy-user-3"]);
   expect(assistantMatches).toEqual(["legacy-assistant-1", "legacy-assistant-2", "legacy-assistant-3"]);
+});
+
+test("chatGptTurnLocatorSelector binds both data-turn-id and container-only turns", () => {
+  type DominoModule = { createDocument(html: string): Document };
+  const domino: DominoModule = require("@mixmark-io/domino");
+  const document = domino.createDocument(`<body><main>
+    <div data-turn-id-container="both-ids" id="both-container">
+      <div data-turn-id="both-ids" id="both-inner">
+        <p>Answer text</p>
+      </div>
+    </div>
+    <div data-turn-id-container="container-only" id="only-container">
+      <p>Fallback answer text</p>
+    </div>
+  </main></body>`);
+
+  const bothMatches = Array.from(document.querySelectorAll(chatGptTurnLocatorSelector("both-ids"))).map(el => el.id);
+  const containerMatches = Array.from(document.querySelectorAll(chatGptTurnLocatorSelector("container-only"))).map(el => el.id);
+
+  expect(bothMatches).toEqual(["both-inner"]);
+  expect(containerMatches).toEqual(["only-container"]);
 });

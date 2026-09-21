@@ -206,6 +206,45 @@ test("submission DOM tracks modern ChatGPT turns keyed by data-turn-id when data
   expect(await worker.currentSubmissionEvidence(page, baseline)).toBe("assistant_turn");
 });
 
+test("waitForNewAssistantTurn binds container-only turn when inner data-turn-id is absent", async () => {
+  const containerLocator = { id: "container-turn" };
+  const hiddenLocator = {
+    filter() { return this; },
+    last() { return this; },
+    isVisible: async () => false,
+    count: async () => 0,
+  };
+  const page = {
+    isClosed: () => false,
+    locator: (selector: string) => {
+      if (selector.includes("[data-turn-id-container=")) {
+        return containerLocator;
+      }
+      return hiddenLocator;
+    },
+  } as unknown as Page;
+  const worker = Object.create(ChatGptBrowserWorker.prototype) as {
+    submissionDomState(page: Page, cache: unknown): Promise<{
+      turnIdentities: string[];
+      userIdentities: string[];
+      responseIdentities: string[];
+    }>;
+    waitForNewAssistantTurn(page: Page, baseline: unknown, deadline?: number): Promise<{
+      identity: string;
+      locator: unknown;
+    }>;
+  };
+  worker.submissionDomState = async () => ({
+    turnIdentities: ["user-1", "container-only-assistant"],
+    userIdentities: ["user-1"],
+    responseIdentities: ["container-only-assistant"],
+  });
+  const baseline = { initialTurnIdentities: ["user-1"], domCache: {} };
+  const binding = await worker.waitForNewAssistantTurn(page, baseline, Date.now() + 10_000);
+  expect(binding.identity).toBe("container-only-assistant");
+  expect(binding.locator).toBe(containerLocator);
+});
+
 test("assistant tracking rebinds only one proven replacement after React detaches its node", () => {
   expect(chatGptReboundTurnIdentity(
     ["conversation-turn-1"],

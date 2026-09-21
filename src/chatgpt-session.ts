@@ -71,6 +71,11 @@ export const CHATGPT_USER_TURN_SELECTOR = [
   '[data-testid^="conversation-turn-"]:has([data-message-author-role="user"])',
 ].join(", ");
 
+export function chatGptTurnLocatorSelector(identity: string): string {
+  const encoded = JSON.stringify(identity);
+  return `[data-turn-id=${encoded}], [data-turn-id-container=${encoded}]:not(:has([data-turn-id]))`;
+}
+
 export interface ChatGptEffortSliderState {
   min: number;
   max: number;
