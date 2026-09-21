@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { defaultBrokerEndpoint, defaultConfig, ZERO_RISK_CHATGPT_CONNECTOR_NAME } from "../src/config";
+import { CHATGPT_CONNECTOR_NAME, defaultBrokerEndpoint, defaultConfig, DEV_CHATGPT_CONNECTOR_NAME, ZERO_RISK_CHATGPT_CONNECTOR_NAME } from "../src/config";
 import { LAUNCHER_BROWSER_IDLE_URL } from "../src/launcher-browser-host";
 
 setDefaultTimeout(30_000);
@@ -46,6 +46,34 @@ test("production and DEV setup reject the removed connector-name option before c
     expect(existsSync(join(root, "dev", "config.json"))).toBeFalse();
     const help = await runCli(["--help"], env);
     expect(help.stdout).not.toContain("--app-name");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("production and DEV setup accept the legitimate default connector name", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-legitimate-connector-"));
+  try {
+    const env = {
+      ...process.env,
+      CODEX_HOME: join(root, "codex"),
+      CODEX_CHATGPT_WEB_HOME: join(root, "app"),
+      CODEX_CHATGPT_WEB_DEV_HOME: join(root, "dev"),
+    };
+    const devResult = await runCli([
+      "dev", "setup", "--browser-only", "--app-name", DEV_CHATGPT_CONNECTOR_NAME, "--acknowledge-unofficial",
+    ], env);
+    expect(devResult.stderr).not.toMatch(/Unknown.*arguments/);
+
+    const devResultBase = await runCli([
+      "dev", "setup", "--browser-only", "--app-name", CHATGPT_CONNECTOR_NAME, "--acknowledge-unofficial",
+    ], env);
+    expect(devResultBase.stderr).not.toMatch(/Unknown.*arguments/);
+
+    const prodResult = await runCli([
+      "setup", "--browser-only", "--app-name", CHATGPT_CONNECTOR_NAME, "--acknowledge-unofficial",
+    ], env);
+    expect(prodResult.stderr).not.toMatch(/Unknown.*arguments/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
