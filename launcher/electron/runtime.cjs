@@ -8,6 +8,7 @@ const {
   connectorNameForDevSetup,
   connectorNameForSetup,
   CURRENT_CONNECTOR_NAME,
+  DEV_CONNECTOR_NAME,
   isLegacyConnectorName,
   requireCurrentRuntimeConnectorName,
   validateConnectorName,
@@ -922,11 +923,7 @@ class RuntimeHost {
   }
 
   setupConnectorName() {
-    const current = this.runtimeConfigSnapshot();
-    if (typeof current.config?.automaticAppName === "string" && current.config.automaticAppName.trim()) {
-      return validateConnectorName(current.config.automaticAppName);
-    }
-    return this.browserConnectorName();
+    return this.launcherProfile === "development" ? DEV_CONNECTOR_NAME : CURRENT_CONNECTOR_NAME;
   }
 
   cancelActiveTurns() {
@@ -1015,7 +1012,6 @@ class RuntimeHost {
       "--acknowledge-unofficial",
       "--restart-service",
     ];
-    if (mode === "full") args.push("--app-name", this.setupConnectorName());
     const result = await this.runSetup("core-setup", args, {
       message: "Installing ChatGPT Web models into Codex",
       successMessage: "Codex integration installed",
@@ -1046,7 +1042,6 @@ class RuntimeHost {
       }),
       "--acknowledge-unofficial",
     ];
-    if (mode === "full") args.push("--app-name", this.setupConnectorName());
     const result = await this.runDevSetup("dev-profile-setup", args, {
       message: "Configuring the isolated DEV harness",
       successMessage: "Isolated DEV harness configured",
@@ -1074,7 +1069,6 @@ class RuntimeHost {
         contextFlag,
       ];
       if (current.config?.autoApproveToolCalls === true) args.push("--auto-approve-tool-calls");
-      if (mode === "full") args.push("--app-name", this.setupConnectorName());
       const result = await this.runDevSetup("bigger-context", args, {
         message: enabled ? "Enabling Bigger Context" : "Disabling Bigger Context",
         successMessage: enabled ? "Bigger Context enabled" : "Standard context restored",
@@ -1094,13 +1088,40 @@ class RuntimeHost {
       contextFlag,
     ];
     if (current.config?.autoApproveToolCalls === true) args.push("--auto-approve-tool-calls");
-    if (mode === "full") args.push("--app-name", this.setupConnectorName());
     const result = await this.runSetup("bigger-context", args, {
       message: enabled ? "Enabling Bigger Context" : "Disabling Bigger Context",
       successMessage: enabled ? "Bigger Context enabled; restart Codex" : "Standard context restored; restart Codex",
       timeoutMs: CORE_SETUP_TIMEOUT_MS,
     });
     return { ...result, mode, enabled: enabled === true };
+  }
+
+  async setSkillAttachments(enabled) {
+    const current = this.runtimeConfigSnapshot();
+    if (!current.configured) throw new Error("Initialize the runtime before changing Skills as files");
+    if (current.config?.browserInteractionMode === "manual") {
+      throw new Error("Skills as files is unavailable in Zero Risk mode");
+    }
+    const development = this.launcherProfile === "development";
+    const args = [
+      ...(development ? ["dev", "setup"] : ["setup"]),
+      current.mode === "full" ? "--full" : "--browser-only",
+      "--browser-host-descriptor", this.browserDescriptorPath,
+      ...this.browserInteractionArgs(),
+      "--acknowledge-unofficial",
+      ...(development ? [] : ["--replace-codex-route", "--restart-service"]),
+      enabled === true ? "--skill-attachments" : "--inline-skills",
+    ];
+    if (current.config?.autoApproveToolCalls === true) args.push("--auto-approve-tool-calls");
+    const options = {
+      message: enabled ? "Enabling Skills as files" : "Disabling Skills as files",
+      successMessage: enabled ? "Skills as files enabled" : "Inline skills restored",
+      timeoutMs: CORE_SETUP_TIMEOUT_MS,
+    };
+    const result = development
+      ? await this.runDevSetup("skill-attachments", args, options)
+      : await this.runSetup("skill-attachments", args, options);
+    return { ...result, enabled: enabled === true };
   }
 
   async setZeroRiskPro(enabled) {
@@ -1118,8 +1139,6 @@ class RuntimeHost {
       "--browser-host-descriptor",
       this.browserDescriptorPath,
       ...this.browserInteractionArgs({ mode: "manual" }),
-      "--app-name",
-      this.setupConnectorName(),
       "--acknowledge-unofficial",
       "--standard-context",
       profileFlag,
@@ -1181,9 +1200,6 @@ class RuntimeHost {
       "--acknowledge-unofficial",
       "--restart-service",
     ];
-    if (existing.mode === "full") {
-      args.push("--app-name", this.setupConnectorName());
-    }
     const result = await this.runSetup("runtime-upgrade", args, {
       message: tunnelProfileMigrationRequired
         ? `Separating ${interactionMode === "manual" ? "Zero Risk" : "Automatic"} MCP credentials`
@@ -1220,8 +1236,6 @@ class RuntimeHost {
       "--browser-host-descriptor",
       this.browserDescriptorPath,
       ...this.browserInteractionArgs({ mode: targetMode }),
-      "--app-name",
-      this.setupConnectorName(),
       "--replace-codex-route",
     ];
     if (reuseSavedCredentials) {
@@ -1274,8 +1288,6 @@ class RuntimeHost {
       "--browser-host-descriptor",
       this.browserDescriptorPath,
       ...this.browserInteractionArgs({ mode: targetMode }),
-      "--app-name",
-      this.setupConnectorName(),
       "--acknowledge-unofficial",
     ];
     if (reuseSavedCredentials) {
@@ -1324,7 +1336,6 @@ class RuntimeHost {
         : "--standard-context",
     ];
     if (current.config?.autoApproveToolCalls === true) args.push("--auto-approve-tool-calls");
-    if (current.mode === "full") args.push("--app-name", this.setupConnectorName());
     const options = {
       message: mode === "manual"
         ? "Enabling Zero Risk"
@@ -1365,7 +1376,7 @@ class RuntimeHost {
           ...options,
           message: "Validating Codex configuration before changing the runtime",
           successMessage: "Codex configuration is ready for setup",
-          timeoutMs: Math.min(options.timeoutMs || 15_000, 15_000),
+          timeoutMs: options.timeoutMs || CORE_SETUP_TIMEOUT_MS,
         });
       }
       runtimeTransitionStarted = true;
