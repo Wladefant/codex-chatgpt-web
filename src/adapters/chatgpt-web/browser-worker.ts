@@ -1183,6 +1183,25 @@ export const MAX_CHATGPT_BROWSER_PAGE_REBINDS = 2;
 export const CHATGPT_RESPONSE_DOM_PROBE_TIMEOUT_MS = CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS;
 /** Consecutive unreadable response-DOM probes tolerated before the turn is failed as retryable. */
 export const MAX_CHATGPT_RESPONSE_OBSERVATION_TIMEOUTS = 12;
+/**
+ * Budget for one navigation-tolerant submission confirmation probe. ChatGPT's freshly routed
+ * conversation document is still hydrating and opening its response stream while this probe runs,
+ * so it must fail fast and be polled again instead of holding the whole send stage (#12).
+ */
+export const CHATGPT_SUBMISSION_CONFIRMATION_PROBE_TIMEOUT_MS = 1_000;
+/**
+ * Interval between Node-side submission confirmation probes. Acceptance never waits inside the
+ * page: an in-page MutationObserver promise issued across ChatGPT's route change to /c/<id> can
+ * stay unresolved for the entire send budget (#12).
+ */
+export const CHATGPT_SUBMISSION_POLL_INTERVAL_MS = 100;
+/**
+ * How long an unreadable turn-identity scan stays inconclusive after Send. ChatGPT routes to the
+ * new conversation and renders Stop about a second before it exposes a consistent turn container,
+ * so a scan that rejects that half-built DOM inside this window is not a verdict about the
+ * submission; the Node-side confirmations own the window (#12).
+ */
+export const CHATGPT_SUBMISSION_CONFIRMATION_GRACE_MS = 3_000;
 
 export class ChatGptBrowserObservationTimeoutError extends Error {
   constructor(timeoutMs: number, options?: { cause?: unknown }) {
@@ -1304,6 +1323,8 @@ interface ChatGptSubmissionBaseline {
   userTurns: Locator;
   responseTurns: Locator;
   initialTurnIdentities: readonly string[];
+  /** The conversation surface the prompt was attached to, for Node-side navigation evidence. */
+  url: string;
   domCache: ChatGptSubmissionDomCache;
 }
 
@@ -1384,7 +1405,41 @@ export function chatGptTurnIsComplete(state: {
     && state.completionActionVisible;
 }
 
-export type ChatGptSubmissionEvidence = "user_turn" | "assistant_turn" | "generation_running" | "mcp_tool_call";
+export type ChatGptSubmissionEvidence =
+  | "user_turn"
+  | "assistant_turn"
+  | "generation_running"
+  | "conversation_navigation"
+  | "mcp_tool_call";
+
+const CHATGPT_CONVERSATION_PATH = /^\/c\/([^/]+)/;
+
+/** ChatGPT exposes a submitted conversation at /c/<id>; a draft surface has no conversation path. */
+export function chatGptConversationIdFromUrl(url: string | undefined): string | undefined {
+  if (!url) return undefined;
+  let pathname: string;
+  try {
+    ({ pathname } = new URL(url));
+  } catch {
+    return undefined;
+  }
+  return CHATGPT_CONVERSATION_PATH.exec(pathname)?.[1];
+}
+
+/**
+ * ChatGPT routes to the conversation it just created only once its backend accepted the submitted
+ * message, so the route change proves submission by itself. Playwright holds the current URL in its
+ * own frame state, which stays readable while the new document is too busy to answer a single
+ * in-page evaluation (#12).
+ */
+export function chatGptSubmissionNavigationEvidence(
+  baselineUrl: string | undefined,
+  currentUrl: string | undefined,
+): boolean {
+  const current = chatGptConversationIdFromUrl(currentUrl);
+  if (current === undefined) return false;
+  return current !== chatGptConversationIdFromUrl(baselineUrl);
+}
 
 export function chatGptSubmissionEvidence(state: {
   initialTurnIdentities: readonly string[];
@@ -2837,6 +2892,7 @@ export class ChatGptBrowserWorker {
     completionTracker?: ChatGptCompletionTracker,
   ): Promise<ChatGptSubmissionEvidence> {
     if (signal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
+    const graceDeadline = Date.now() + CHATGPT_SUBMISSION_CONFIRMATION_GRACE_MS;
     for (;;) {
       if (signal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
       const progress = externalProgress?.snapshot();
@@ -2852,33 +2908,127 @@ export class ChatGptBrowserWorker {
       await throwIfChatGptRateLimitDialog(page);
       // Until the new response is bound, last() can still be a historical failed answer.
       // Response errors are checked against the bound current turn in the observation loops.
+      const confirmationAbort = new AbortController();
+      const confirmationSignal = signal
+        ? AbortSignal.any([confirmationAbort.signal, signal])
+        : confirmationAbort.signal;
+      // The turn-identity scan is the only observation that needs a rendered conversation, so it is
+      // also the only one the post-send route change can stall. It runs against the Node-side
+      // confirmations rather than ahead of them, and an unreadable DOM stays inconclusive until the
+      // route-change grace expires (#12).
+      const identityScan = this.currentSubmissionEvidence(page, baseline, signal).then(
+        value => ({ kind: "evidence" as const, value }),
+        (error: unknown) => {
+          const remainingGraceMs = graceDeadline - Date.now();
+          if (remainingGraceMs <= 0 || error instanceof ChatGptBrowserObservationTimeoutError) throw error;
+          return new Promise<{ kind: "evidence"; value: undefined }>(resolveGrace => {
+            setTimeout(() => resolveGrace({ kind: "evidence", value: undefined }), remainingGraceMs);
+          });
+        },
+      );
       let evidence: ChatGptSubmissionEvidence | undefined;
-      if (externalProgress) {
-        const progressWaitAbort = new AbortController();
-        const progressSignal = signal
-          ? AbortSignal.any([progressWaitAbort.signal, signal])
-          : progressWaitAbort.signal;
-        try {
-          const observed = await withBrowserTurnAbort(Promise.race([
-            this.currentSubmissionEvidence(page, baseline, signal).then(value => ({ kind: "dom" as const, value })),
-            externalProgress.waitForChange(progress?.revision ?? 0, progressSignal)
-              .then(() => ({ kind: "external" as const })),
-          ]), signal);
-          if (observed.kind === "external") continue;
-          evidence = observed.value;
-        } finally {
-          progressWaitAbort.abort();
+      try {
+        const races: Array<Promise<
+          { kind: "evidence"; value: ChatGptSubmissionEvidence | undefined } | { kind: "external" }
+        >> = [
+          identityScan,
+          this.pollSubmissionConfirmation(page, baseline, confirmationSignal)
+            .then(value => ({ kind: "evidence" as const, value })),
+        ];
+        if (externalProgress) {
+          races.push(externalProgress.waitForChange(progress?.revision ?? 0, confirmationSignal)
+            .then(() => ({ kind: "external" as const })));
         }
-      } else {
-        evidence = await this.currentSubmissionEvidence(page, baseline, signal);
+        const observed = await withBrowserTurnAbort(Promise.race(races), signal);
+        if (observed.kind === "external") continue;
+        evidence = observed.value;
+      } finally {
+        confirmationAbort.abort();
+        // A scan that only settles after Node-side evidence already proved acceptance is moot.
+        identityScan.catch(() => {});
       }
       if (evidence) return evidence;
-      await this.waitForTurnDomOrExternalProgress(
-        page,
+      await this.waitForSubmissionPollInterval(
         progress?.revision ?? 0,
         externalProgress,
         signal,
       );
+    }
+  }
+
+  /**
+   * Polls the two confirmations that need no rendered conversation — the route change to /c/<id>
+   * and a visible Stop control — from Node, so an accepted submission is provable while ChatGPT's
+   * new conversation document cannot answer an evaluation at all (#12). It only ever resolves by
+   * confirming; the caller races it and aborts it once another observation decides the turn.
+   */
+  private async pollSubmissionConfirmation(
+    page: Page,
+    baseline: ChatGptSubmissionBaseline,
+    signal: AbortSignal,
+  ): Promise<ChatGptSubmissionEvidence | undefined> {
+    while (!signal.aborted) {
+      if (chatGptSubmissionNavigationEvidence(baseline.url, page.url())) return "conversation_navigation";
+      if (await this.submissionGenerationRunning(page, signal)) return "generation_running";
+      await new Promise<void>(resolveInterval => {
+        setTimeout(resolveInterval, CHATGPT_SUBMISSION_POLL_INTERVAL_MS);
+      });
+    }
+    return undefined;
+  }
+
+  /**
+   * Reports whether ChatGPT currently shows a Stop control, using one short evaluation that
+   * installs nothing and asserts no turn identities: the routed conversation renders Stop well
+   * before it exposes a consistent turn container, which the full scan rejects outright. A probe
+   * the busy document could not answer is not a verdict, so it reads as "not running" and the
+   * caller polls again.
+   */
+  private async submissionGenerationRunning(page: Page, signal: AbortSignal): Promise<boolean> {
+    try {
+      return await withChatGptBrowserObservationTimeout(
+        withBrowserTurnAbort(page.evaluate(selector => [...document.querySelectorAll(selector)].some(element => {
+          const candidate = element as HTMLElement;
+          const bounds = candidate.getBoundingClientRect();
+          return candidate.isConnected
+            && getComputedStyle(candidate).visibility !== "hidden"
+            && (bounds.width > 0 || bounds.height > 0);
+        }), CHATGPT_STOP_BUTTON_SELECTOR), signal),
+        CHATGPT_SUBMISSION_CONFIRMATION_PROBE_TIMEOUT_MS,
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Waits one poll interval, or less when external progress arrives. Submission acceptance waits on
+   * this Node timer instead of an in-page mutation observer, which the route change can leave
+   * unresolved for the whole send budget (#12).
+   */
+  private async waitForSubmissionPollInterval(
+    afterProgressRevision: number,
+    externalProgress?: ChatGptTurnProgressReader,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const interval = new Promise<void>(resolveInterval => {
+      setTimeout(resolveInterval, CHATGPT_SUBMISSION_POLL_INTERVAL_MS);
+    });
+    if (!externalProgress) {
+      await withBrowserTurnAbort(interval, signal);
+      return;
+    }
+    const progressWaitAbort = new AbortController();
+    const progressSignal = signal
+      ? AbortSignal.any([progressWaitAbort.signal, signal])
+      : progressWaitAbort.signal;
+    try {
+      await withBrowserTurnAbort(Promise.race([
+        interval,
+        externalProgress.waitForChange(afterProgressRevision, progressSignal).then(() => undefined),
+      ]), signal);
+    } finally {
+      progressWaitAbort.abort();
     }
   }
 
@@ -2979,6 +3129,9 @@ export class ChatGptBrowserWorker {
     baseline: ChatGptSubmissionBaseline,
     signal?: AbortSignal,
   ): Promise<ChatGptSubmissionEvidence | undefined> {
+    // Route evidence is read from Node before any DOM work: it is conclusive on its own and it is
+    // available exactly when the routed conversation cannot yet be scanned (#12).
+    if (chatGptSubmissionNavigationEvidence(baseline.url, page.url())) return "conversation_navigation";
     const state = await this.submissionDomState(page, baseline.domCache, signal);
     return chatGptSubmissionEvidence({
       initialTurnIdentities: baseline.initialTurnIdentities,
@@ -3012,6 +3165,7 @@ export class ChatGptBrowserWorker {
       userTurns,
       responseTurns,
       initialTurnIdentities: state.turnIdentities,
+      url: page.url(),
       domCache,
     };
   }
