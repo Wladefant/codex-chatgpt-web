@@ -61,6 +61,7 @@ import {
   CHATGPT_USER_TURN_SELECTOR,
   activateChatGptEffortMenu,
   detectChatGptAccountCapabilities,
+  chatGptTurnLocatorSelector,
   parseChatGptEffortSliderState,
 } from "../../chatgpt-session";
 import { loginVerificationMarkerPath } from "../../browser-login";
@@ -160,8 +161,12 @@ const CHATGPT_DOM_REVISION_ATTRIBUTES = [
   "aria-disabled",
   "aria-expanded",
   "class",
+  "data-content-search-turn-key",
+  "data-content-search-unit-key",
   "data-item-anchor",
   "data-is-last-node",
+  "data-markdown-text-style",
+  "data-markdown-text-tone",
   "data-message-author-role",
   "data-state",
   "data-streaming-response-status",
@@ -169,6 +174,8 @@ const CHATGPT_DOM_REVISION_ATTRIBUTES = [
   "data-turn",
   "data-turn-id",
   "data-turn-id-container",
+  "data-turn-key",
+  "data-user-message-bubble",
   "disabled",
   "hidden",
   "inert",
@@ -1878,6 +1885,14 @@ const CHATGPT_DIAGNOSTIC_SAFE_STRING_KEYS = new Set([
   "dataState",
   "dataHighlighted",
   "origin",
+  "dataTestId",
+  "dataTurnId",
+  "dataTurnIdContainer",
+  "dataMessageAuthorRole",
+  "dataTurn",
+  "id",
+  "className",
+  "ariaLabel",
 ]);
 
 /** Defense in depth: persisted browser traces contain structure, never rendered UI text. */
@@ -3064,7 +3079,24 @@ export class ChatGptBrowserWorker {
       const observerKey = `${observerState.id}:${observerState.revision}`;
       if (options.knownKey === observerKey) return { key: observerKey };
       const identities = (elements: Element[], attribute: string): string[] => {
-        const values = elements.map(element => element.getAttribute(attribute));
+        const values = elements.map(element => {
+          const direct = element.getAttribute(attribute);
+          if (direct && direct.trim().length > 0) return direct;
+          if (attribute === "data-turn-id" || attribute === "data-content-search-unit-key") {
+            const unitKey = element.getAttribute("data-content-search-unit-key")
+              ?? element.closest("[data-content-search-unit-key]")?.getAttribute("data-content-search-unit-key")
+              ?? element.querySelector("[data-content-search-unit-key]")?.getAttribute("data-content-search-unit-key");
+            if (unitKey && unitKey.trim().length > 0) return unitKey;
+
+            const containerAttr = element.getAttribute("data-turn-id-container");
+            if (containerAttr && containerAttr.trim().length > 0) return containerAttr;
+            const closestTurnId = element.closest("[data-turn-id]")?.getAttribute("data-turn-id");
+            if (closestTurnId && closestTurnId.trim().length > 0) return closestTurnId;
+            const closestContainerId = element.closest("[data-turn-id-container]")?.getAttribute("data-turn-id-container");
+            if (closestContainerId && closestContainerId.trim().length > 0) return closestContainerId;
+          }
+          return direct;
+        });
         if (values.some(value => typeof value !== "string" || value.trim().length === 0)) {
           throw new Error(`ChatGPT conversation turn has no stable ${attribute} identity`);
         }
@@ -3084,10 +3116,21 @@ export class ChatGptBrowserWorker {
       };
       // data-testid contains a display index: ChatGPT can renumber it while the same turn lives.
       // Virtualization removes a turn's section, but retains its outer identity container.
-      const containers = [...document.querySelectorAll("[data-turn-id-container]")].filter(element =>
-        element.parentElement?.closest("[data-turn-id-container]")?.getAttribute("data-turn-id-container")
-          !== element.getAttribute("data-turn-id-container"));
-      const turnIdentities = identities(containers, "data-turn-id-container");
+      const containerElements = [...document.querySelectorAll("[data-turn-id-container]")];
+      const unitKeyElements = [...document.querySelectorAll("[data-content-search-unit-key]")];
+      const turnIdElements = [...document.querySelectorAll("[data-turn-id]")];
+      const containers = containerElements.length > 0
+        ? containerElements.filter(element =>
+          element.parentElement?.closest("[data-turn-id-container]")?.getAttribute("data-turn-id-container")
+            !== element.getAttribute("data-turn-id-container"))
+        : unitKeyElements.length > 0
+          ? unitKeyElements
+          : turnIdElements;
+      const turnIdentities = containerElements.length > 0
+        ? identities(containers, "data-turn-id-container")
+        : unitKeyElements.length > 0
+          ? identities(containers, "data-content-search-unit-key")
+          : identities(containers, "data-turn-id");
       const userIdentities = identities([...document.querySelectorAll(options.userTurnSelector)], "data-turn-id");
       const responseIdentities = identities([...document.querySelectorAll(options.assistantTurnSelector)], "data-turn-id");
       const knownTurns = new Set(turnIdentities);
@@ -3152,7 +3195,7 @@ export class ChatGptBrowserWorker {
       state.responseIdentities,
     );
     if (!identity) return "";
-    const locator = page.locator(`[data-turn-id=${JSON.stringify(identity)}]`);
+    const locator = page.locator(chatGptTurnLocatorSelector(identity));
     return (await this.responseDomSnapshot(locator, {})).visibleText;
   }
 
@@ -3252,7 +3295,7 @@ export class ChatGptBrowserWorker {
         && completionTracker?.needsToolBatchObservation(progress.lastToolBatchRevision)) {
         const boundaryText = identity
           ? (await this.responseDomSnapshot(
-            observationPage.locator(`[data-turn-id=${JSON.stringify(identity)}]`),
+            observationPage.locator(chatGptTurnLocatorSelector(identity)),
             {},
           )).visibleText
           : "";
@@ -3261,7 +3304,7 @@ export class ChatGptBrowserWorker {
       }
       if (identity) return {
         identity,
-        locator: observationPage.locator(`[data-turn-id=${JSON.stringify(identity)}]`),
+        locator: observationPage.locator(chatGptTurnLocatorSelector(identity)),
         acceptedTurnIdentities: state.turnIdentities,
       };
       // A delayed renderer wake can cross the grace while the assistant appears. Only a fresh
@@ -3305,7 +3348,7 @@ export class ChatGptBrowserWorker {
     if (!identity || identity === binding.identity) return binding;
     return {
       identity,
-      locator: page.locator(`[data-turn-id=${JSON.stringify(identity)}]`),
+      locator: page.locator(chatGptTurnLocatorSelector(identity)),
       acceptedTurnIdentities: state.turnIdentities,
     };
   }
@@ -4203,14 +4246,17 @@ export class ChatGptBrowserWorker {
       // ChatGPT's DIL renderer has no .markdown class (#538). Read its response root within the
       // assistant-owned PUIK container; the CSS module hash is build-specific. Both renderers
       // feed the same content serializer and completion checks below, without reading UI text.
-      const answerRootSelector = '.markdown, [data-message-author-role="assistant"] .puik-root.not-markdown > [class*="_DilResponseRoot"]';
-      // ChatGPT uses the same content renderer for intermediate commentary and for the final
-      // answer. Older responses nested commentary in the streaming-status container. Pro can also
-      // render a completed commentary Markdown root immediately before that live status container.
-      // Final-answer Markdown follows the live status instead, so DOM order remains the semantic
-      // boundary without relying on localized labels such as "Pro thinking".
-      const allMarkdownRoots = [...root.querySelectorAll<HTMLElement>(answerRootSelector)]
-        .filter(candidate => !candidate.parentElement?.closest(answerRootSelector))
+      const answerRootSelector = [
+        '.markdown',
+        '[data-markdown-text-style="assistant-message"]',
+        '[class*="MarkdownRoot"]',
+        '[data-message-author-role="assistant"] .puik-root.not-markdown > [class*="_DilResponseRoot"]',
+      ].join(", ");
+      const allMarkdownRoots = [
+        ...(root.matches(answerRootSelector) ? [root] : []),
+        ...root.querySelectorAll<HTMLElement>(answerRootSelector),
+      ]
+        .filter(candidate => candidate === root || !candidate.parentElement?.closest(answerRootSelector))
         .filter(renderedInDom);
       const streamingStatusContainers = [...root.querySelectorAll<HTMLElement>("[data-streaming-response-status]")]
         .filter(renderedInDom);
@@ -5314,7 +5360,7 @@ export class ChatGptBrowserWorker {
             };
             responseTurn = {
               ...responseTurn,
-              locator: page.locator(`[data-turn-id=${JSON.stringify(responseTurn.identity)}]`),
+              locator: page.locator(chatGptTurnLocatorSelector(responseTurn.identity)),
             };
             responseDomCache.key = undefined;
             responseDomCache.snapshot = undefined;
