@@ -6,12 +6,12 @@ import { join } from "node:path";
 import { createContext, runInContext } from "node:vm";
 import type { Locator, Page } from "playwright-core";
 import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPLETION_SETTLE_MS, CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS, CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS, ChatGptCompletionTracker, chatGptExternalProgressSuppressesDomHealth, CHATGPT_RESPONSE_DOM_GRACE_MS, MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_COMPOSER_SELECT_ALL_KEY, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptSubmissionRejectionObserver, ChatGptPromptAttachmentIntegrityError, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCheckpoint, chatGptConnectorAttachmentMode, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptSubmissionEvidence, connectAfterClosingBrowserConnection, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, sanitizeChatGptBrowserDiagnosticState, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout, CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS, browserStageTimeouts, ChatGptSuspensionClock, remainingStageBudgetMs } from "../src/adapters/chatgpt-web/browser-worker";
-import { assertChatGptResponseTurnGone, CHATGPT_RESPONSE_DOM_PROBE_TIMEOUT_MS, ensureChatGptPersonalizedConnectorAccess, chatGptUnavailableProDetail } from "../src/adapters/chatgpt-web/browser-worker";
+import { assertChatGptResponseTurnGone, CHATGPT_RESPONSE_DOM_PROBE_TIMEOUT_MS, CHATGPT_SUBMISSION_CONFIRMATION_GRACE_MS, chatGptConversationIdFromUrl, chatGptSubmissionNavigationEvidence, ensureChatGptPersonalizedConnectorAccess, chatGptUnavailableProDetail } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptStoppedThinkingError } from "../src/adapters/chatgpt-web/adapter-error";
 import { CHATGPT_STOPPED_THINKING_LABELS } from "../src/adapters/chatgpt-web/ui-labels";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
 import { CHATGPT_CONNECTOR_NAME, DEV_CHATGPT_CONNECTOR_NAME, defaultChromeExecutable, legacyChatGptConnectorMigrationMessage } from "../src/config";
-import { parseChatGptEffortSliderState } from "../src/chatgpt-session";
+import { CHATGPT_TEMPORARY_CHAT_URL, parseChatGptEffortSliderState } from "../src/chatgpt-session";
 import { ChatGptExternalTurnProgress, chatGptExternalToolCallsAreInFlight } from "../src/adapters/chatgpt-web/turn-progress";
 import type { CodexProviderConfig } from "../src/types";
 import { compileChatGptWebPrompt, formatChatGptWebMultipartCommit, formatChatGptWebMultipartStage } from "../src/adapters/chatgpt-web/prompt";
@@ -128,6 +128,7 @@ test("submission DOM tracks logical identities and retains virtualized history i
   const page = {
     evaluate: async (callback: Function, options: unknown) => runInContext(`(${callback.toString()})`, context)(options),
     locator: () => ({}),
+    url: () => CHATGPT_TEMPORARY_CHAT_URL,
   } as unknown as Page;
   const worker = Object.create(ChatGptBrowserWorker.prototype) as {
     captureSubmissionBaseline(page: Page): Promise<{ initialTurnIdentities: string[]; domCache: { fullScans: number } }>;
@@ -465,11 +466,13 @@ test("compaction retry submission evidence cannot make prompt-stage settlement u
       evaluateStarted = true;
       return await new Promise<never>(() => {});
     },
-  } as any;
+    url: () => CHATGPT_TEMPORARY_CHAT_URL,
+  };
   const baseline = {
     domCache: {},
     initialTurnIdentities: [],
-  } as any;
+    url: CHATGPT_TEMPORARY_CHAT_URL,
+  };
   const prototype = ChatGptBrowserWorker.prototype as unknown as {
     runStage<T>(
       traceId: string,
@@ -566,6 +569,7 @@ test("an accepted Full-mode send survives one stalled DOM probe and a later MCP 
   type Baseline = {
     responseTurns: { last(): unknown };
     initialTurnIdentities: string[];
+    url: string;
     domCache: Record<string, unknown>;
   };
   type Recovery = { page: Page; baseline: Baseline };
@@ -614,6 +618,7 @@ test("an accepted Full-mode send survives one stalled DOM probe and a later MCP 
     locator: (selector: string) => selector.startsWith("[data-turn-id=")
       ? assistantLocator
       : hiddenLocator,
+    url: () => CHATGPT_TEMPORARY_CHAT_URL,
   } as unknown as Page;
   let sendPresses = 0;
   const sendButton = {
@@ -644,6 +649,7 @@ test("an accepted Full-mode send survives one stalled DOM probe and a later MCP 
   const baseline: Baseline = {
     responseTurns: { last: () => hiddenLocator },
     initialTurnIdentities: [],
+    url: CHATGPT_TEMPORARY_CHAT_URL,
     domCache: {},
   };
   const reboundBaseline: Baseline = { ...baseline, domCache: {} };
@@ -2536,6 +2542,7 @@ function dialogPage(text: string, buttonText = "Got it", errorActionVisible = fa
         };
         return action;
       },
+      url: () => CHATGPT_TEMPORARY_CHAT_URL,
     } as unknown as Page,
     pressed,
   };
@@ -2930,6 +2937,131 @@ test("proven current-turn MCP activity is conclusive submission evidence", async
     0,
   )).resolves.toBe("mcp_tool_call");
 
+});
+
+test("the routed conversation URL identifies an accepted submission", () => {
+  const draft = "https://chatgpt.com/?temporary-chat=true";
+  const conversation = "https://chatgpt.com/c/local-chatgpt:0f6b1a52-9f7c-4a2e-9a17-6f0b3d9c8e41?temporary-chat=true";
+
+  expect(chatGptConversationIdFromUrl(draft)).toBeUndefined();
+  expect(chatGptConversationIdFromUrl("https://chatgpt.com/")).toBeUndefined();
+  expect(chatGptConversationIdFromUrl("chatgpt.com/c/only-a-path")).toBeUndefined();
+  expect(chatGptConversationIdFromUrl(conversation)).toBe("local-chatgpt:0f6b1a52-9f7c-4a2e-9a17-6f0b3d9c8e41");
+
+  expect(chatGptSubmissionNavigationEvidence(draft, draft)).toBeFalse();
+  expect(chatGptSubmissionNavigationEvidence(draft, conversation)).toBeTrue();
+  // A retained conversation keeps its route across turns, so it never confirms on its own.
+  expect(chatGptSubmissionNavigationEvidence(conversation, conversation)).toBeFalse();
+  expect(chatGptSubmissionNavigationEvidence(conversation, draft)).toBeFalse();
+  // Switching conversations is a new conversation identity, which only a submission creates.
+  expect(chatGptSubmissionNavigationEvidence(
+    conversation,
+    "https://chatgpt.com/c/local-chatgpt:2b8d4e60-1c3f-4d5a-8b9e-7a6c5d4e3f21",
+  )).toBeTrue();
+});
+
+type SubmissionConfirmationFixture = {
+  worker: { waitForSubmissionAccepted(page: Page, baseline: unknown): Promise<string> };
+  page: Page;
+  baseline: { initialTurnIdentities: string[]; url: string; domCache: Record<string, unknown> };
+  probes: { identityScans: number; stopControls: number };
+};
+
+/**
+ * The DOM ChatGPT exposes right after Send (issue #12): the conversation route has changed and the
+ * Stop control renders, while the turn containers the identity scan needs do not exist yet.
+ */
+function submissionConfirmationFixture(
+  currentUrl: () => string,
+  identityScan: () => never | Promise<never>,
+  stopControlVisible: (probe: number) => boolean,
+): SubmissionConfirmationFixture {
+  const probes = { identityScans: 0, stopControls: 0 };
+  const hidden = {
+    filter() { return this; },
+    last() { return this; },
+    getByRole() { return this; },
+    isVisible: async () => false,
+  };
+  return {
+    worker: Object.create(ChatGptBrowserWorker.prototype) as SubmissionConfirmationFixture["worker"],
+    page: {
+      isClosed: () => false,
+      locator: () => hidden,
+      url: currentUrl,
+      // The full scan passes its selector set as an options object; the Stop probe passes only the
+      // Stop selector string, which is how this fixture tells the two evaluations apart.
+      evaluate: async (_run: unknown, argument: unknown) => {
+        if (typeof argument === "string") {
+          probes.stopControls += 1;
+          return stopControlVisible(probes.stopControls);
+        }
+        probes.identityScans += 1;
+        return identityScan();
+      },
+    } as unknown as Page,
+    baseline: { initialTurnIdentities: [], url: CHATGPT_TEMPORARY_CHAT_URL, domCache: {} },
+    probes,
+  };
+}
+
+test("the post-send route change confirms submission while the turn-identity scan is stalled", async () => {
+  let routed = false;
+  const fixture = submissionConfirmationFixture(
+    () => (routed
+      ? "https://chatgpt.com/c/local-chatgpt:0f6b1a52-9f7c-4a2e-9a17-6f0b3d9c8e41?temporary-chat=true"
+      : CHATGPT_TEMPORARY_CHAT_URL),
+    // ChatGPT's hydrating conversation document answers no evaluation at all.
+    () => new Promise<never>(() => {}),
+    // ChatGPT routes to the new conversation while the send is already being polled, so the route
+    // change lands on the poll after the first Stop probe rather than on a wall-clock delay.
+    () => { routed = true; return false; },
+  );
+
+  await expect(fixture.worker.waitForSubmissionAccepted(fixture.page, fixture.baseline))
+    .resolves.toBe("conversation_navigation");
+  // The stalled scan was in flight and never got to decide the turn.
+  expect(fixture.probes.identityScans).toBe(1);
+});
+
+test("a visible Stop control confirms submission while the routed DOM has no turn container", async () => {
+  const fixture = submissionConfirmationFixture(
+    () => CHATGPT_TEMPORARY_CHAT_URL,
+    () => { throw new Error("ChatGPT conversation turn has no matching identity container"); },
+    probe => probe > 1,
+  );
+
+  await expect(fixture.worker.waitForSubmissionAccepted(fixture.page, fixture.baseline))
+    .resolves.toBe("generation_running");
+  expect(fixture.probes.stopControls).toBeGreaterThan(1);
+});
+
+test("an unreadable turn-identity scan still fails the send once its route-change grace expires", async () => {
+  const fixture = submissionConfirmationFixture(
+    () => CHATGPT_TEMPORARY_CHAT_URL,
+    () => { throw new Error("ChatGPT conversation turn has no matching identity container"); },
+    () => false,
+  );
+  const startedAt = Date.now();
+
+  await expect(fixture.worker.waitForSubmissionAccepted(fixture.page, fixture.baseline))
+    .rejects.toThrow("ChatGPT conversation turn has no matching identity container");
+  expect(Date.now() - startedAt).toBeGreaterThanOrEqual(CHATGPT_SUBMISSION_CONFIRMATION_GRACE_MS);
+  expect(fixture.probes.identityScans).toBeGreaterThan(1);
+});
+
+test("a stalled DOM observation is never held by the route-change grace", async () => {
+  const stall = new ChatGptBrowserObservationTimeoutError(CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS);
+  const fixture = submissionConfirmationFixture(
+    () => CHATGPT_TEMPORARY_CHAT_URL,
+    () => { throw stall; },
+    () => false,
+  );
+  const startedAt = Date.now();
+
+  // Page rebinding owns an unresponsive surface, so this failure must reach its recovery wrapper.
+  await expect(fixture.worker.waitForSubmissionAccepted(fixture.page, fixture.baseline)).rejects.toBe(stall);
+  expect(Date.now() - startedAt).toBeLessThan(CHATGPT_SUBMISSION_CONFIRMATION_GRACE_MS);
 });
 
 test("unrelated ChatGPT alerts are not terminal", async () => {
