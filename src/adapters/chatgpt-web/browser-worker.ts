@@ -145,6 +145,12 @@ export const CHATGPT_TOOL_CONFIRMATION_TIMEOUT_MS = 60_000;
 export const MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS = 3;
 const CHATGPT_CONNECTOR_MENTION_QUERY = "@codex";
 const CHATGPT_CONNECTOR_ACTION_TIMEOUT_MS = 10_000;
+export const CHATGPT_CONNECTOR_PILL_SELECTOR = [
+  '[data-id^="plugin:"][data-keyword]',
+  '[app-mention-name]',
+  '[app-mention-display-name]',
+  '[data-prompt-link-href^="app://"]',
+].join(", ");
 const CHATGPT_SMOKE_TEXT = "Reply with exactly: CODEX WEB GPT READY";
 const CHATGPT_SMOKE_EXPECTED = "CODEX WEB GPT READY";
 /**
@@ -1496,15 +1502,20 @@ export async function setChatGptThinkMode(
   const target = enabled ? "true" : "false";
   if (pressed !== target) {
     const composer = composerForm.locator(CHATGPT_COMPOSER_SELECTOR).filter({ visible: true }).first();
-    const composerState = () => composer.evaluate(element => {
+    const composerState = () => composer.evaluate((element, pillSelector) => {
       const copy = element.cloneNode(true) as HTMLElement;
-      const pills = [...copy.querySelectorAll('[data-id^="plugin:"][data-keyword]')];
-      const connectors = pills.map(pill => pill.getAttribute("data-keyword")).sort();
+      const pills = [...copy.querySelectorAll(pillSelector)];
+      const connectors = pills.map(pill => (
+        pill.getAttribute("data-keyword")
+        || pill.getAttribute("app-mention-display-name")
+        || pill.getAttribute("app-mention-name")
+        || pill.textContent?.trim()
+      )).filter(Boolean).sort();
       for (const pill of pills) pill.remove();
       const text = element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement
         ? element.value : copy.textContent ?? "";
       return { text: text.trim(), connectors };
-    }, undefined, actionOptions);
+    }, CHATGPT_CONNECTOR_PILL_SELECTOR, actionOptions);
     const before = await composerState();
     if (before.text) throw new Error("ChatGPT Think selection requires an empty prompt draft");
     await composer.focus(actionOptions);
@@ -1893,6 +1904,7 @@ const CHATGPT_DIAGNOSTIC_SAFE_STRING_KEYS = new Set([
   "id",
   "className",
   "ariaLabel",
+  "attributes",
 ]);
 
 /** Defense in depth: persisted browser traces contain structure, never rendered UI text. */
@@ -1977,6 +1989,7 @@ class ChatGptBrowserDiagnostics {
           stopButtonSelector,
           completionActionSelector,
           appName,
+          connectorPillSelector,
         }) => {
           const rendered = (element: Element): boolean => {
             const candidate = element as HTMLElement;
@@ -2012,10 +2025,17 @@ class ChatGptBrowserDiagnostics {
           const composers = [...document.querySelectorAll(composerSelector)].filter(rendered);
           const assistantTurns = [...document.querySelectorAll(assistantTurnSelector)].filter(rendered);
           const selectedConnectors = composers.flatMap(composer => (
-            [...composer.querySelectorAll('[data-id^="plugin:"][data-keyword]')]
+            [...composer.querySelectorAll(connectorPillSelector)]
           ))
             .filter(rendered);
-          const exactConnectorRows = [...document.querySelectorAll('.__menu-item[tabindex="0"]')]
+          const exactConnectorRows = [...document.querySelectorAll([
+            '[data-composer-overlay-floating-ui] button',
+            '.__menu-item[tabindex="0"]',
+            '[data-radix-collection-item]',
+            '[role="option"]',
+            '[role="menuitem"]',
+            '.popover [tabindex="0"]',
+          ].join(", "))]
             .filter(element => rendered(element) && exactText(element, appName));
           const currentUrl = new URL(location.href);
           const integerAttribute = (element: Element, name: string): number | null => {
@@ -2048,7 +2068,9 @@ class ChatGptBrowserDiagnostics {
               })),
               selectedConnectorCount: selectedConnectors.length,
               exactSelectedConnectorCount: selectedConnectors.filter(
-                element => element.getAttribute("data-keyword") === appName,
+                element => element.getAttribute("data-keyword") === appName
+                  || element.getAttribute("app-mention-display-name") === appName
+                  || (element.textContent?.includes(appName) ?? false),
               ).length,
             },
             focus: {
@@ -2066,7 +2088,7 @@ class ChatGptBrowserDiagnostics {
                 max: integerAttribute(element, "aria-valuemax"),
                 value: integerAttribute(element, "aria-valuenow"),
               })),
-            menus: rows('[role="menu"], [role="listbox"], [data-testid="composer-intelligence-picker-content"]', 20),
+            menus: rows('[data-composer-overlay-floating-ui], [role="menu"], [role="listbox"], [data-testid="composer-intelligence-picker-content"]', 20),
             connectorRows: exactConnectorRows.slice(-20).map(element => {
               const rect = element.getBoundingClientRect();
               return {
@@ -2103,6 +2125,7 @@ class ChatGptBrowserDiagnostics {
           stopButtonSelector: CHATGPT_STOP_BUTTON_SELECTOR,
           completionActionSelector: CHATGPT_COMPLETION_ACTION_SELECTOR,
           appName: this.appName,
+          connectorPillSelector: CHATGPT_CONNECTOR_PILL_SELECTOR,
         })),
       ]);
       const capturedAt = new Date().toISOString();
@@ -3337,7 +3360,8 @@ export class ChatGptBrowserWorker {
     }
     const state = await this.submissionDomState(page, baseline.domCache, signal);
     const acceptedTurns = new Set(binding.acceptedTurnIdentities);
-    if (state.userIdentities.some(identity => !acceptedTurns.has(identity))) {
+    const acceptedUserCount = baseline.initialUserTurnCount + 1;
+    if (state.userTurnCount > acceptedUserCount && state.userIdentities.some(identity => !acceptedTurns.has(identity))) {
       throw new Error("ChatGPT opened another user turn while the bound assistant response was detached");
     }
     const identity = chatGptReboundTurnIdentity(
@@ -3355,17 +3379,23 @@ export class ChatGptBrowserWorker {
 
   private async attachedPromptText(page: Page, abortSignal?: AbortSignal): Promise<string> {
     const composer = await this.activeComposer(page, 30_000, abortSignal);
-    return composer.evaluate(element => {
+    return composer.evaluate((element, pillSelector) => {
       const clone = element.cloneNode(true) as HTMLElement;
-      clone.querySelectorAll(
-        '[data-id^="plugin:"][data-keyword], [data-inline-selection-pill-cursor-target]',
-      )
-        .forEach(part => part.remove());
+      const pills = [...clone.querySelectorAll(pillSelector)];
+      if (pills.length > 1) {
+        const removed = pills.map(p => ({
+          tag: p.tagName,
+          attrs: [...p.attributes].map(a => `${a.name}=${a.value}`).join(" "),
+          text: p.textContent,
+        }));
+        console.warn(`[chatgpt-web] REMOVED_PILLS: count=${pills.length} items=${JSON.stringify(removed.slice(0, 5))}`);
+      }
+      pills.forEach(part => part.remove());
       return [...clone.childNodes]
         .map(child => child.textContent ?? "")
         .join("\n")
         .trimStart();
-    }, undefined, { timeout: 20_000, signal: abortSignal });
+    }, CHATGPT_CONNECTOR_PILL_SELECTOR, { timeout: 20_000, signal: abortSignal });
   }
 
   private async assertPromptAttached(
@@ -3387,23 +3417,40 @@ export class ChatGptBrowserWorker {
     }
     throwIfPromptAttachmentAborted(abortSignal);
     const commonPrefix = this.promptEquivalentPrefixLength(prompt, observed);
+    console.info(
+      `[chatgpt-web] PROMPT_MISMATCH: expectedChars=${prompt.length} actualChars=${observed.length} commonPrefix=${commonPrefix}`
+      + ` expectedAtDiff=${JSON.stringify(prompt.slice(Math.max(0, commonPrefix - 20), commonPrefix + 60))}`
+      + ` observedAtDiff=${JSON.stringify(observed.slice(Math.max(0, commonPrefix - 20), commonPrefix + 60))}`
+    );
     throw new ChatGptPromptAttachmentIntegrityError(
       `ChatGPT composer did not preserve the complete prompt (expectedChars=${prompt.length}, actualChars=${observed.length}, commonPrefixChars=${commonPrefix})`,
     );
   }
 
   private selectedConnectorControl(composer: Locator): Locator {
+    const appName = this.config.appName;
+    const mentionSlug = appName.toLowerCase().replace(/\s+/g, "-");
     return composer
-      .locator('[data-id^="plugin:"][data-keyword]')
-      .filter({ hasText: this.config.appName, visible: true });
+      .locator([
+        `[data-id^="plugin:"][data-keyword="${appName}"]`,
+        `[app-mention-display-name="${appName}"]`,
+        `[app-mention-name="${mentionSlug}"]`,
+        `[data-prompt-link-label="$${mentionSlug}"]`,
+        CHATGPT_CONNECTOR_PILL_SELECTOR,
+      ].join(", "))
+      .filter({ visible: true });
   }
 
   private async connectorIsSelected(composer: Locator, abortSignal?: AbortSignal): Promise<boolean> {
     const selected = this.selectedConnectorControl(composer);
     const keywords = await withBrowserTurnAbort(
-      withChatGptBrowserObservationTimeout(selected.evaluateAll(elements => (
-        elements.map(element => element.getAttribute("data-keyword"))
-      ))),
+      withChatGptBrowserObservationTimeout(selected.evaluateAll((elements, appName) => (
+        elements.map(element => (
+          element.getAttribute("data-keyword")
+          || element.getAttribute("app-mention-display-name")
+          || (element.textContent?.includes(appName as string) ? appName : null)
+        ))
+      ), this.config.appName)),
       abortSignal,
     );
     const exactMatches = keywords.filter(keyword => keyword === this.config.appName).length;
@@ -3429,6 +3476,11 @@ export class ChatGptBrowserWorker {
     }
     return texts
       .map(text => (text.split("\n")[0] ?? "").replace(/\s+/g, " ").trim())
+      .map(title => {
+        if (title.startsWith(DEV_CHATGPT_CONNECTOR_NAME)) return DEV_CHATGPT_CONNECTOR_NAME;
+        if (title.startsWith(this.config.appName)) return this.config.appName;
+        return title;
+      })
       .filter(title => title.length > 0);
   }
 
@@ -3503,7 +3555,15 @@ export class ChatGptBrowserWorker {
       throwIfPromptAttachmentAborted(abortSignal);
     };
     let composer: Locator;
-    const menuRows = page.locator('.__menu-item[tabindex="0"]');
+    const menuRows = page.locator([
+      '[data-composer-overlay-floating-ui] button',
+      '.__menu-item[tabindex="0"]',
+      '[data-radix-collection-item]',
+      '[role="option"]',
+      '[role="menuitem"]',
+      '[data-testid*="mention"]',
+      '.popover [tabindex="0"]',
+    ].join(", "));
     const appResult = menuRows.filter({
       has: page.getByText(this.config.appName, { exact: true }),
     });
@@ -3649,29 +3709,38 @@ export class ChatGptBrowserWorker {
         signal: abortSignal,
         timeout: CHATGPT_CONNECTOR_ACTION_TIMEOUT_MS,
       }) !== null;
-      if (!await rowHighlighted()) {
-        const visibleRowCount = await withBrowserTurnAbort(
-          withChatGptBrowserObservationTimeout(menuRows.filter({ visible: true }).count()),
-          abortSignal,
-        );
-        for (let step = 0; step < visibleRowCount && !await rowHighlighted(); step += 1) {
-          await composer.press("ArrowDown", {
+      let activatedByClick = false;
+      if (typeof appResult.click === "function") {
+        try {
+          await appResult.click({
+            force: true,
+            timeout: 2_000,
             signal: abortSignal,
-            timeout: CHATGPT_CONNECTOR_ACTION_TIMEOUT_MS,
           });
+          activatedByClick = true;
+        } catch {
+          // Pointer activation failed or timed out; keyboard activation will be used
         }
       }
-      if (!await rowHighlighted()) {
-        throw new Error(`ChatGPT connector menu could not highlight ${JSON.stringify(this.config.appName)}`);
+      if (!activatedByClick) {
+        if (!await rowHighlighted()) {
+          const visibleRowCount = await withBrowserTurnAbort(
+            withChatGptBrowserObservationTimeout(menuRows.filter({ visible: true }).count()),
+            abortSignal,
+          );
+          for (let step = 0; step < visibleRowCount && !await rowHighlighted(); step += 1) {
+            await composer.press("ArrowDown", {
+              signal: abortSignal,
+              timeout: CHATGPT_CONNECTOR_ACTION_TIMEOUT_MS,
+            });
+          }
+        }
+        await composer.press("Enter", {
+          signal: abortSignal,
+          timeout: CHATGPT_CONNECTOR_ACTION_TIMEOUT_MS,
+        });
       }
-      await composer.press("Enter", {
-        signal: abortSignal,
-        timeout: CHATGPT_CONNECTOR_ACTION_TIMEOUT_MS,
-      });
       await capture("connector-choice-activated");
-      // Selecting a connector replaces the Lexical composer subtree. Resolve the active composer
-      // again instead of returning the pre-selection locator, otherwise the real turn can focus a
-      // detached/hidden editor even though verification just succeeded.
       const selectedComposer = await this.activeComposer(page, 30_000, abortSignal);
       const selectedConnector = this.selectedConnectorControl(selectedComposer);
       await selectedConnector.waitFor({
@@ -3838,14 +3907,25 @@ export class ChatGptBrowserWorker {
     await captureDiagnostic?.("send-ready");
     const initialToolBatchRevision = externalProgress?.snapshot().lastToolBatchRevision ?? 0;
     await submissionLifecycle?.onSendActivated?.();
-    await sendButton.press("Enter", {
-      noWaitAfter: true,
-      signal: abortSignal,
-      // runStage owns the operation budget. A second Locator timeout would silently collapse the
-      // 180-second Bigger Context budget back to the ordinary 20 seconds after Enter has already
-      // submitted the message; semantic submission evidence below remains the authority.
-      timeout: 0,
-    });
+    let sentByClick = false;
+    try {
+      await sendButton.click({
+        force: true,
+        noWaitAfter: true,
+        signal: abortSignal,
+        timeout: 2_000,
+      });
+      sentByClick = true;
+    } catch {
+      // Pointer activation failed or timed out; keyboard activation will be used
+    }
+    if (!sentByClick) {
+      await sendButton.press("Enter", {
+        noWaitAfter: true,
+        signal: abortSignal,
+        timeout: 0,
+      });
+    }
     const evidence = await this.waitForSubmissionAcceptedWithRecovery(
       page,
       baseline,
