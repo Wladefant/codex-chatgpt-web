@@ -12,7 +12,9 @@ import {
 } from "../src/chatgpt-session";
 
 test("composer and effort selectors exclude unrelated editable fields and menu buttons", () => {
-  const { createDocument } = require("@mixmark-io/domino") as { createDocument(html: string): Document };
+  type DominoModule = { createDocument(html: string): Document };
+  const domino: DominoModule = require("@mixmark-io/domino");
+  const { createDocument } = domino;
   const document = createDocument(`<body><form>
     <div contenteditable="true" id="unrelated-editor"></div>
     <textarea placeholder="Search" id="search"></textarea>
@@ -25,6 +27,16 @@ test("composer and effort selectors exclude unrelated editable fields and menu b
     <div contenteditable="true" role="textbox" id="composer-textbox"></div>
     <button aria-haspopup="menu" data-tone="neutral" id="effort"></button>
     <button aria-haspopup="menu" data-testid="model-switcher-dropdown-button" id="model"></button>
+    <button type="button"
+      class="no-drag cursor-interaction items-center select-none focus:outline-hidden disabled:cursor-default aria-disabled:cursor-default disabled:opacity-40 aria-disabled:opacity-40 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-0 whitespace-nowrap flex gap-1.5 border-0 rounded-full text-tertiary not-disabled:not-aria-disabled:hover:bg-primary-ghost-hover data-[state=open]:bg-primary-ghost-hover border-transparent h-(--spacing-token-button-composer) py-0 ps-3 pe-3.5 text-base leading-relaxed min-w-0"
+      aria-label="Select ChatGPT model"
+      id="radix-_r_3m_"
+      aria-haspopup="menu"
+      aria-expanded="false"
+      data-state="closed"
+      data-codex-intelligence-trigger="true"
+      data-composer-navigation-target="reasoning"
+      data-selected-reasoning-effort="medium"></button>
     <button data-testid="send-button" id="send-testid"></button>
     <button aria-label="Send" id="send-aria"></button>
     <button data-testid="stop-button" id="stop-testid"></button>
@@ -39,7 +51,7 @@ test("composer and effort selectors exclude unrelated editable fields and menu b
     "composer-markdown",
     "composer-textbox",
   ]);
-  expect(matches(CHATGPT_EFFORT_CONTROL_SELECTOR)).toEqual(["effort", "model"]);
+  expect(matches(CHATGPT_EFFORT_CONTROL_SELECTOR)).toEqual(["effort", "model", "radix-_r_3m_"]);
   expect(matches(CHATGPT_SEND_BUTTON_SELECTOR)).toEqual(["send-testid", "send-aria"]);
   expect(matches(CHATGPT_STOP_BUTTON_SELECTOR)).toEqual(["stop-testid", "stop-aria"]);
 });
@@ -208,7 +220,7 @@ test("a transient effort control does not turn a Luna-only account into Sol", as
   expect(visibilityReads).toBe(2);
 });
 
-function reasoningPicker(options: { max?: string; delay?: number; missing?: boolean } = {}) {
+function reasoningPicker(options: { max?: string; delay?: number; missing?: boolean; selectedEffort?: string } = {}) {
   let value = 0;
   const keys: string[] = [];
   const hidden = {
@@ -238,7 +250,11 @@ function reasoningPicker(options: { max?: string; delay?: number; missing?: bool
   };
   const control = {
     last() { return this; }, waitFor: async () => {}, isVisible: async () => true,
-    getAttribute: async (name: string) => name === "aria-expanded" ? "true" : null,
+    getAttribute: async (name: string) => {
+      if (name === "aria-expanded") return "true";
+      if (name === "data-selected-reasoning-effort") return options.selectedEffort ?? null;
+      return null;
+    },
   };
   const composer = { filter() { return this; }, last() { return this; }, locator: () => ({ locator: () => control }) };
   const modelRows = { count: async () => 3, first() { return this; }, waitFor: async () => {}, nth: () => { throw new Error("Model rows are not effort choices"); } };
@@ -272,10 +288,87 @@ test("the authoritative three-step range is non-Pro; a malformed range fails clo
 
 test("Pro selection changes the hidden slider through its visible owner, never through model rows", async () => {
   const fixture = reasoningPicker({ delay: 50 });
-  const select = (ChatGptBrowserWorker.prototype as unknown as {
+  type WorkerSelectPrototype = {
     selectModelAndEffort(...args: unknown[]): Promise<unknown>;
-  }).selectModelAndEffort;
+  };
+  const workerProto: WorkerSelectPrototype = ChatGptBrowserWorker.prototype as never;
+  const select = workerProto.selectModelAndEffort;
   await select.call({ activeComposer: async () => fixture.composer }, fixture.page, "gpt-5.6-sol", "max", { localToolsEnabled: false, solAvailable: true, proAvailable: true });
   expect(fixture.keys).toEqual(["ArrowRight", "ArrowRight", "ArrowRight", "ArrowRight"]);
   expect(fixture.value()).toBe(4);
+});
+
+test("effort control selector matches both issue #9 updated DOM and legacy buttons", () => {
+  type DominoModule = { createDocument(html: string): Document };
+  const domino: DominoModule = require("@mixmark-io/domino");
+  const document = domino.createDocument(`<body><form>
+    <!-- Old selectors -->
+    <button aria-haspopup="menu" data-tone="neutral" id="legacy-tone"></button>
+    <button aria-haspopup="menu" data-testid="model-switcher-dropdown-button" id="legacy-testid"></button>
+    <!-- Issue #9 updated reasoning button -->
+    <button type="button"
+      class="no-drag cursor-interaction items-center select-none focus:outline-hidden disabled:cursor-default aria-disabled:cursor-default disabled:opacity-40 aria-disabled:opacity-40 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-0 whitespace-nowrap flex gap-1.5 border-0 rounded-full text-tertiary not-disabled:not-aria-disabled:hover:bg-primary-ghost-hover data-[state=open]:bg-primary-ghost-hover border-transparent h-(--spacing-token-button-composer) py-0 ps-3 pe-3.5 text-base leading-relaxed min-w-0"
+      aria-label="Select ChatGPT model"
+      id="issue-9-reasoning-btn"
+      aria-haspopup="menu"
+      aria-expanded="false"
+      data-state="closed"
+      data-codex-intelligence-trigger="true"
+      data-composer-navigation-target="reasoning"
+      data-selected-reasoning-effort="medium"></button>
+    <!-- Unrelated menu button that should be excluded -->
+    <button aria-haspopup="menu" id="attachments-menu"></button>
+  </form></body>`);
+  const matches = (selector: string) => Array.from(document.querySelectorAll(selector)).map(element => element.id);
+  expect(matches(CHATGPT_EFFORT_CONTROL_SELECTOR)).toEqual([
+    "legacy-tone",
+    "legacy-testid",
+    "issue-9-reasoning-btn",
+  ]);
+});
+
+test("selectModelAndEffort short-circuits when data-selected-reasoning-effort matches requested effort", async () => {
+  const fixture = reasoningPicker({ selectedEffort: "medium" });
+  type WorkerSelectPrototype = {
+    selectModelAndEffort(...args: unknown[]): Promise<{ effort: string }>;
+  };
+  const workerProto: WorkerSelectPrototype = ChatGptBrowserWorker.prototype as never;
+  const select = workerProto.selectModelAndEffort;
+  const diagnostics: string[] = [];
+  const result = await select.call(
+    { activeComposer: async () => fixture.composer },
+    fixture.page,
+    "gpt-5.6-sol",
+    "medium",
+    { localToolsEnabled: false, solAvailable: true, proAvailable: true },
+    async (checkpoint: string) => { diagnostics.push(checkpoint); },
+  );
+  expect(result.effort).toBe("medium");
+  expect(diagnostics).toContain("effort-already-selected");
+  expect(diagnostics).toContain("effort-selected");
+  expect(fixture.keys).toEqual([]);
+  expect(fixture.value()).toBe(0);
+});
+
+test("selectModelAndEffort proceeds to slider when data-selected-reasoning-effort differs from requested effort", async () => {
+  const fixture = reasoningPicker({ selectedEffort: "low" });
+  type WorkerSelectPrototype = {
+    selectModelAndEffort(...args: unknown[]): Promise<{ effort: string }>;
+  };
+  const workerProto: WorkerSelectPrototype = ChatGptBrowserWorker.prototype as never;
+  const select = workerProto.selectModelAndEffort;
+  const diagnostics: string[] = [];
+  const result = await select.call(
+    { activeComposer: async () => fixture.composer },
+    fixture.page,
+    "gpt-5.6-sol",
+    "medium",
+    { localToolsEnabled: false, solAvailable: true, proAvailable: true },
+    async (checkpoint: string) => { diagnostics.push(checkpoint); },
+  );
+  expect(result.effort).toBe("medium");
+  expect(diagnostics).not.toContain("effort-already-selected");
+  expect(diagnostics).toContain("effort-selected");
+  expect(fixture.keys).toEqual(["ArrowRight"]);
+  expect(fixture.value()).toBe(1);
 });

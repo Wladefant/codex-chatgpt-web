@@ -11,8 +11,13 @@ export const CHATGPT_COMPOSER_SELECTOR = [
   '[contenteditable="true"][role="textbox"]',
 ].join(", ");
 export const CHATGPT_EFFORT_CONTROL_SELECTOR = [
+  'button[aria-haspopup="menu"][data-composer-navigation-target="reasoning"]',
+  'button[data-composer-navigation-target="reasoning"]',
+  'button[aria-haspopup="menu"][data-selected-reasoning-effort]',
+  'button[data-selected-reasoning-effort]',
   'button[aria-haspopup="menu"][data-tone="neutral"]',
   'button[data-testid="model-switcher-dropdown-button"][aria-haspopup="menu"]',
+  'button[aria-haspopup="menu"][aria-label="Select ChatGPT model"]',
 ].join(", ");
 export const CHATGPT_EFFORT_MENU_SELECTOR = [
   '[data-testid="composer-intelligence-picker-content"]:has([role="menuitemradio"], [data-model-reasoning-effort-slider])',
@@ -227,7 +232,9 @@ export async function detectChatGptAccountCapabilities(
   const menu = page.locator(CHATGPT_EFFORT_MENU_SELECTOR).last();
   const menuVisible = await menu.isVisible().catch(() => false);
   const menuExpanded = await effortButton.getAttribute("aria-expanded").catch(() => null);
-  if (!menuVisible && menuExpanded !== "true") await effortButton.press("Enter");
+  if (!menuVisible && menuExpanded !== "true") {
+    await effortButton.click({ force: true }).catch(() => effortButton.press("Enter")).catch(() => {});
+  }
   try {
     const { sliderContainer, slider } = chatGptEffortSlider(page);
     const timeout = options.selectorTimeoutMs ?? 70_000;
