@@ -10,8 +10,13 @@ const CHATGPT_COMPOSER_SELECTOR = [
   '[contenteditable="true"][role="textbox"]',
 ].join(", ");
 const CHATGPT_EFFORT_CONTROL_SELECTOR = [
+  'button[aria-haspopup="menu"][data-composer-navigation-target="reasoning"]',
+  'button[data-composer-navigation-target="reasoning"]',
+  'button[aria-haspopup="menu"][data-selected-reasoning-effort]',
+  'button[data-selected-reasoning-effort]',
   'button[aria-haspopup="menu"][data-tone="neutral"]',
   'button[data-testid="model-switcher-dropdown-button"][aria-haspopup="menu"]',
+  'button[aria-haspopup="menu"][aria-label="Select ChatGPT model"]',
 ].join(", ");
 const CHATGPT_EFFORT_MENU_SELECTOR = [
   '[data-testid="composer-intelligence-picker-content"]:has([role="menuitemradio"], [data-model-reasoning-effort-slider])',
@@ -31,7 +36,7 @@ async function detectCapabilities(page) {
     solAvailable = true;
     const menu = page.locator(CHATGPT_EFFORT_MENU_SELECTOR).last();
     const menuVisible = await menu.isVisible().catch(() => false);
-    if (!menuVisible) await effortButton.press("Enter").catch(() => {});
+    if (!menuVisible) await effortButton.click().catch(() => effortButton.press("Enter").catch(() => {}));
     const efforts = menu.locator(CHATGPT_EFFORT_ITEM_SELECTOR);
     const slider = page.locator(CHATGPT_EFFORT_SLIDER_SELECTOR).filter({ visible: true }).last();
     const sliderVisible = await slider.waitFor({ state: "visible", timeout: 5000 }).then(() => true).catch(() => false);

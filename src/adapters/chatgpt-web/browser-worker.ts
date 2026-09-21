@@ -2450,6 +2450,12 @@ export class ChatGptBrowserWorker {
     await settleChatGptUi();
     await throwIfChatGptRateLimitDialog(page);
     await captureDiagnostic?.("effort-control-ready");
+    const currentSelectedEffort = await currentEffort.getAttribute("data-selected-reasoning-effort").catch(() => null);
+    if (currentSelectedEffort && currentSelectedEffort.trim().toLowerCase() === mode.effort.toLowerCase()) {
+      await captureDiagnostic?.("effort-already-selected");
+      await captureDiagnostic?.("effort-selected");
+      return mode;
+    }
     await throwIfChatGptRateLimitDialog(page);
     const activation = await activateChatGptEffortMenu(page, currentEffort);
     if (activation.method === "pointerdown") {
