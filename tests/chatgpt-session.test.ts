@@ -1,12 +1,14 @@
 import { expect, test } from "bun:test";
 import { ChatGptBrowserWorker } from "../src/adapters/chatgpt-web/browser-worker";
 import {
+  CHATGPT_ASSISTANT_TURN_SELECTOR,
   CHATGPT_COMPOSER_SELECTOR,
   CHATGPT_EFFORT_CONTROL_SELECTOR,
   CHATGPT_EFFORT_MENU_SELECTOR,
   CHATGPT_EFFORT_SLIDER_CONTAINER_SELECTOR,
   CHATGPT_SEND_BUTTON_SELECTOR,
   CHATGPT_STOP_BUTTON_SELECTOR,
+  CHATGPT_USER_TURN_SELECTOR,
   activateChatGptEffortMenu,
   detectChatGptAccountCapabilities,
 } from "../src/chatgpt-session";
@@ -415,4 +417,75 @@ test("selectModelAndEffort proceeds to slider when data-selected-reasoning-effor
   expect(diagnostics).toContain("effort-selected");
   expect(fixture.keys).toEqual(["ArrowRight"]);
   expect(fixture.value()).toBe(1);
+});
+test("turn selectors match modern ChatGPT DOM with data-turn-id and data-message-author-role without conversation-turn testid", () => {
+  type DominoModule = { createDocument(html: string): Document };
+  const domino: DominoModule = require("@mixmark-io/domino");
+  const document = domino.createDocument(`<body><main>
+    <!-- Captured modern ChatGPT DOM: no conversation-turn-* testids -->
+    <div data-turn-id-container="turn-user-1">
+      <div data-turn-id="turn-user-1" id="user-turn-node">
+        <div data-message-author-role="user">
+          <p>ALPHA</p>
+        </div>
+      </div>
+    </div>
+    <div data-turn-id-container="turn-assistant-1">
+      <div data-turn-id="turn-assistant-1" id="assistant-turn-node">
+        <div data-message-author-role="assistant">
+          <div class="markdown">
+            <p>TURN ONE OK</p>
+          </div>
+        </div>
+      </div>
+    </div>
+    <!-- Unrelated status overlay from diagnostic snapshot -->
+    <div role="status" aria-expanded="false" id="status-overlay"></div>
+  </main></body>`);
+
+  const userMatches = Array.from(document.querySelectorAll(CHATGPT_USER_TURN_SELECTOR)).map(el => el.id);
+  const assistantMatches = Array.from(document.querySelectorAll(CHATGPT_ASSISTANT_TURN_SELECTOR)).map(el => el.id);
+
+  expect(userMatches).toEqual(["user-turn-node"]);
+  expect(assistantMatches).toEqual(["assistant-turn-node"]);
+});
+
+test("turn selectors match direct data-turn attributes and container-level roles", () => {
+  type DominoModule = { createDocument(html: string): Document };
+  const domino: DominoModule = require("@mixmark-io/domino");
+  const document = domino.createDocument(`<body><main>
+    <article data-turn-id="u-direct" data-turn="user" id="u-direct"></article>
+    <article data-turn-id="a-direct" data-turn="assistant" id="a-direct"></article>
+    <div data-turn-id-container="u-container" data-message-author-role="user" id="u-container"></div>
+    <div data-turn-id-container="a-container" data-message-author-role="assistant" id="a-container"></div>
+  </main></body>`);
+
+  const userMatches = Array.from(document.querySelectorAll(CHATGPT_USER_TURN_SELECTOR)).map(el => el.id);
+  const assistantMatches = Array.from(document.querySelectorAll(CHATGPT_ASSISTANT_TURN_SELECTOR)).map(el => el.id);
+
+  expect(userMatches).toEqual(["u-direct", "u-container"]);
+  expect(assistantMatches).toEqual(["a-direct", "a-container"]);
+});
+
+test("turn selectors retain backward compatibility with legacy conversation-turn-N testids", () => {
+  type DominoModule = { createDocument(html: string): Document };
+  const domino: DominoModule = require("@mixmark-io/domino");
+  const document = domino.createDocument(`<body><main>
+    <section data-testid="conversation-turn-1" data-turn="user" id="legacy-user-1"></section>
+    <section data-testid="conversation-turn-2" data-turn="assistant" id="legacy-assistant-1"></section>
+    <section data-testid="conversation-turn-3" data-message-author-role="user" id="legacy-user-2"></section>
+    <section data-testid="conversation-turn-4" data-message-author-role="assistant" id="legacy-assistant-2"></section>
+    <section data-testid="conversation-turn-5" id="legacy-user-3">
+      <div data-message-author-role="user"></div>
+    </section>
+    <section data-testid="conversation-turn-6" id="legacy-assistant-3">
+      <div data-message-author-role="assistant"></div>
+    </section>
+  </main></body>`);
+
+  const userMatches = Array.from(document.querySelectorAll(CHATGPT_USER_TURN_SELECTOR)).map(el => el.id);
+  const assistantMatches = Array.from(document.querySelectorAll(CHATGPT_ASSISTANT_TURN_SELECTOR)).map(el => el.id);
+
+  expect(userMatches).toEqual(["legacy-user-1", "legacy-user-2", "legacy-user-3"]);
+  expect(assistantMatches).toEqual(["legacy-assistant-1", "legacy-assistant-2", "legacy-assistant-3"]);
 });

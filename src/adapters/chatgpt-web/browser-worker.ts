@@ -3064,7 +3064,19 @@ export class ChatGptBrowserWorker {
       const observerKey = `${observerState.id}:${observerState.revision}`;
       if (options.knownKey === observerKey) return { key: observerKey };
       const identities = (elements: Element[], attribute: string): string[] => {
-        const values = elements.map(element => element.getAttribute(attribute));
+        const values = elements.map(element => {
+          const direct = element.getAttribute(attribute);
+          if (direct && direct.trim().length > 0) return direct;
+          if (attribute === "data-turn-id") {
+            const containerAttr = element.getAttribute("data-turn-id-container");
+            if (containerAttr && containerAttr.trim().length > 0) return containerAttr;
+            const closestTurnId = element.closest("[data-turn-id]")?.getAttribute("data-turn-id");
+            if (closestTurnId && closestTurnId.trim().length > 0) return closestTurnId;
+            const closestContainerId = element.closest("[data-turn-id-container]")?.getAttribute("data-turn-id-container");
+            if (closestContainerId && closestContainerId.trim().length > 0) return closestContainerId;
+          }
+          return direct;
+        });
         if (values.some(value => typeof value !== "string" || value.trim().length === 0)) {
           throw new Error(`ChatGPT conversation turn has no stable ${attribute} identity`);
         }
@@ -3084,10 +3096,15 @@ export class ChatGptBrowserWorker {
       };
       // data-testid contains a display index: ChatGPT can renumber it while the same turn lives.
       // Virtualization removes a turn's section, but retains its outer identity container.
-      const containers = [...document.querySelectorAll("[data-turn-id-container]")].filter(element =>
-        element.parentElement?.closest("[data-turn-id-container]")?.getAttribute("data-turn-id-container")
-          !== element.getAttribute("data-turn-id-container"));
-      const turnIdentities = identities(containers, "data-turn-id-container");
+      const containerElements = [...document.querySelectorAll("[data-turn-id-container]")];
+      const containers = containerElements.length > 0
+        ? containerElements.filter(element =>
+          element.parentElement?.closest("[data-turn-id-container]")?.getAttribute("data-turn-id-container")
+            !== element.getAttribute("data-turn-id-container"))
+        : [...document.querySelectorAll("[data-turn-id]")];
+      const turnIdentities = containerElements.length > 0
+        ? identities(containers, "data-turn-id-container")
+        : identities(containers, "data-turn-id");
       const userIdentities = identities([...document.querySelectorAll(options.userTurnSelector)], "data-turn-id");
       const responseIdentities = identities([...document.querySelectorAll(options.assistantTurnSelector)], "data-turn-id");
       const knownTurns = new Set(turnIdentities);
