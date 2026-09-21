@@ -511,3 +511,28 @@ test("chatGptTurnLocatorSelector binds both data-turn-id and container-only turn
   expect(bothMatches).toEqual(["both-inner"]);
   expect(containerMatches).toEqual(["only-container"]);
 });
+
+test("turn selectors match modern ChatGPT unit-key DOM with data-content-search-unit-key", () => {
+  type DominoModule = { createDocument(html: string): Document };
+  const domino: DominoModule = require("@mixmark-io/domino");
+  const document = domino.createDocument(`<body><main>
+    <div data-turn-key="turn-uuid">
+      <div data-content-search-turn-key="search-uuid">
+        <div data-content-search-unit-key="search-uuid:0:user" id="modern-user">
+          <p>User prompt</p>
+        </div>
+        <div data-content-search-unit-key="search-uuid:2:assistant" id="modern-assistant">
+          <p>Assistant reply</p>
+        </div>
+      </div>
+    </div>
+  </main></body>`);
+
+  const userMatches = Array.from(document.querySelectorAll(CHATGPT_USER_TURN_SELECTOR)).map(el => el.id);
+  const assistantMatches = Array.from(document.querySelectorAll(CHATGPT_ASSISTANT_TURN_SELECTOR)).map(el => el.id);
+  const locatorMatches = Array.from(document.querySelectorAll(chatGptTurnLocatorSelector("search-uuid:2:assistant"))).map(el => el.id);
+
+  expect(userMatches).toEqual(["modern-user"]);
+  expect(assistantMatches).toEqual(["modern-assistant"]);
+  expect(locatorMatches).toEqual(["modern-assistant"]);
+});

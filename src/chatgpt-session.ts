@@ -43,6 +43,7 @@ export const CHATGPT_COMPLETION_ACTION_SELECTOR = [
   'button[aria-label="Copy"]',
 ].join(", ");
 export const CHATGPT_ASSISTANT_TURN_SELECTOR = [
+  '[data-content-search-unit-key$=":assistant"]',
   '[data-turn-id][data-turn="assistant"]',
   '[data-turn-id][data-message-author-role="assistant"]',
   '[data-turn-id]:has([data-message-author-role="assistant"])',
@@ -57,6 +58,7 @@ export const CHATGPT_ASSISTANT_TURN_SELECTOR = [
   '[data-testid^="conversation-turn-"]:has([data-message-author-role="assistant"])',
 ].join(", ");
 export const CHATGPT_USER_TURN_SELECTOR = [
+  '[data-content-search-unit-key$=":user"]',
   '[data-turn-id][data-turn="user"]',
   '[data-turn-id][data-message-author-role="user"]',
   '[data-turn-id]:has([data-message-author-role="user"])',
@@ -73,7 +75,11 @@ export const CHATGPT_USER_TURN_SELECTOR = [
 
 export function chatGptTurnLocatorSelector(identity: string): string {
   const encoded = JSON.stringify(identity);
-  return `[data-turn-id=${encoded}], [data-turn-id-container=${encoded}]:not(:has([data-turn-id]))`;
+  return [
+    `[data-turn-id=${encoded}]`,
+    `[data-turn-id-container=${encoded}]:not(:has([data-turn-id]))`,
+    `[data-content-search-unit-key=${encoded}]`,
+  ].join(", ");
 }
 
 export interface ChatGptEffortSliderState {
