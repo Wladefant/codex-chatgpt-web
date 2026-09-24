@@ -2338,6 +2338,7 @@ export class ChatGptBrowserWorker {
   private managedBrowserReady?: Promise<{ browser: Browser; context: BrowserContext }>;
   private launcherHelper?: LauncherBrowserHelperClient;
   private maintenanceTail: Promise<void> = Promise.resolve();
+  private managedTurnTail: Promise<void> = Promise.resolve();
   private readonly activeRuns = new Map<string, Promise<string>>();
 
   private constructor(private readonly config: ResolvedBrowserConfig) {}
@@ -2582,6 +2583,9 @@ export class ChatGptBrowserWorker {
           "--no-first-run",
           "--no-default-browser-check",
           "--disable-blink-features=AutomationControlled",
+          "--disable-background-timer-throttling",
+          "--disable-backgrounding-occluded-windows",
+          "--disable-renderer-backgrounding",
         ],
       });
       const context = await browser.newContext({
@@ -2868,7 +2872,7 @@ export class ChatGptBrowserWorker {
     return composer;
   }
 
-  private async waitForTurnDomMutation(page: Page, timeoutMs = 50): Promise<void> {
+  private async waitForTurnDomMutation(page: Page, timeoutMs = 100): Promise<void> {
     await page.evaluate(({ timeout, attributeFilter }) => new Promise<void>(resolveMutation => {
       let settled = false;
       let settleTimer: ReturnType<typeof setTimeout> | undefined;
@@ -2883,7 +2887,8 @@ export class ChatGptBrowserWorker {
       const observer = new MutationObserver(() => {
         if (settleTimer) return;
         // Let one React mutation batch finish before the next compact state read.
-        settleTimer = setTimeout(finish, 16);
+        // Let one React mutation batch finish before the next compact state read.
+        settleTimer = setTimeout(finish, 100);
       });
       observer.observe(document.documentElement, {
         subtree: true,
@@ -2959,9 +2964,9 @@ export class ChatGptBrowserWorker {
         (error: unknown) => {
           const remainingGraceMs = graceDeadline - Date.now();
           if (remainingGraceMs <= 0 || error instanceof ChatGptBrowserObservationTimeoutError) throw error;
-          return new Promise<{ kind: "evidence"; value: undefined }>(resolveGrace => {
-            setTimeout(() => resolveGrace({ kind: "evidence", value: undefined }), remainingGraceMs);
-          });
+          const { promise, resolve: resolveGrace } = Promise.withResolvers<{ kind: "evidence"; value: undefined }>();
+          setTimeout(() => resolveGrace({ kind: "evidence", value: undefined }), remainingGraceMs);
+          return promise;
         },
       );
       let evidence: ChatGptSubmissionEvidence | undefined;
@@ -3132,10 +3137,10 @@ export class ChatGptBrowserWorker {
       const visible = (element: Element): boolean => {
         const candidate = element as HTMLElement;
         const style = getComputedStyle(candidate);
-        const bounds = candidate.getBoundingClientRect();
         return candidate.isConnected
+          && style.display !== "none"
           && style.visibility !== "hidden"
-          && (bounds.width > 0 || bounds.height > 0);
+          && style.opacity !== "0";
       };
       // data-testid contains a display index: ChatGPT can renumber it while the same turn lives.
       // Virtualization removes a turn's section, but retains its outer identity container.
@@ -3277,22 +3282,33 @@ export class ChatGptBrowserWorker {
         );
       } catch (error) {
         const latestProgress = externalProgress?.snapshot();
-        if (error instanceof ChatGptBrowserObservationTimeoutError && recoverObservation) {
-          recoveryAttempts += 1;
-          if (recoveryAttempts > MAX_CHATGPT_BROWSER_PAGE_REBINDS) {
-            throw new Error(
-              `ChatGPT accepted the message, but its DOM remained unresponsive after ${MAX_CHATGPT_BROWSER_PAGE_REBINDS} same-page rebinds`,
-              { cause: error },
+        if (error instanceof ChatGptBrowserObservationTimeoutError) {
+          if (recoverObservation) {
+            recoveryAttempts += 1;
+            if (recoveryAttempts > MAX_CHATGPT_BROWSER_PAGE_REBINDS) {
+              throw new Error(
+                `ChatGPT accepted the message, but its DOM remained unresponsive after ${MAX_CHATGPT_BROWSER_PAGE_REBINDS} same-page rebinds`,
+                { cause: error },
+              );
+            }
+            const recovered = await recoverObservation(
+              recoveryAttempts,
+              error,
+              observationBaseline,
+              signal,
             );
+            observationPage = recovered.page;
+            observationBaseline = recovered.baseline;
+            continue;
           }
-          const recovered = await recoverObservation(
-            recoveryAttempts,
-            error,
-            observationBaseline,
-            signal,
+          recoveryAttempts += 1;
+          if (recoveryAttempts > MAX_CHATGPT_RESPONSE_OBSERVATION_TIMEOUTS) throw error;
+          console.warn(
+            `[chatgpt-web] assistant turn observation tolerated timeout ${recoveryAttempts}/${MAX_CHATGPT_RESPONSE_OBSERVATION_TIMEOUTS}: ${error.message}`,
           );
-          observationPage = recovered.page;
-          observationBaseline = recovered.baseline;
+          observationBaseline.domCache.key = undefined;
+          observationBaseline.domCache.snapshot = undefined;
+          await new Promise(resolveSleep => setTimeout(resolveSleep, 250));
           continue;
         }
         if (!chatGptExternalProgressIsLive(latestProgress, Date.now(), graceMs)) throw error;
@@ -3854,22 +3870,32 @@ export class ChatGptBrowserWorker {
         );
         return evidence;
       } catch (error) {
-        if (!(error instanceof ChatGptBrowserObservationTimeoutError) || !recoverObservation) throw error;
-        recoveryAttempts += 1;
-        if (recoveryAttempts > MAX_CHATGPT_BROWSER_PAGE_REBINDS) {
-          throw new Error(
-            `ChatGPT submission DOM remained unresponsive after ${MAX_CHATGPT_BROWSER_PAGE_REBINDS} same-page rebinds`,
-            { cause: error },
+        if (!(error instanceof ChatGptBrowserObservationTimeoutError)) throw error;
+        if (recoverObservation) {
+          recoveryAttempts += 1;
+          if (recoveryAttempts > MAX_CHATGPT_BROWSER_PAGE_REBINDS) {
+            throw new Error(
+              `ChatGPT submission DOM remained unresponsive after ${MAX_CHATGPT_BROWSER_PAGE_REBINDS} same-page rebinds`,
+              { cause: error },
+            );
+          }
+          const recovered = await recoverObservation(
+            recoveryAttempts,
+            error,
+            observationBaseline,
+            abortSignal,
           );
+          observationPage = recovered.page;
+          observationBaseline = recovered.baseline;
+          continue;
         }
-        const recovered = await recoverObservation(
-          recoveryAttempts,
-          error,
-          observationBaseline,
-          abortSignal,
+        recoveryAttempts += 1;
+        if (recoveryAttempts > MAX_CHATGPT_RESPONSE_OBSERVATION_TIMEOUTS) throw error;
+        console.warn(
+          `[chatgpt-web] submission accepted observation tolerated timeout ${recoveryAttempts}/${MAX_CHATGPT_RESPONSE_OBSERVATION_TIMEOUTS}: ${error.message}`,
         );
-        observationPage = recovered.page;
-        observationBaseline = recovered.baseline;
+        await new Promise(resolveSleep => setTimeout(resolveSleep, 250));
+        continue;
       }
     }
   }
@@ -4756,7 +4782,15 @@ export class ChatGptBrowserWorker {
     if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
     if (this.config.browserHost !== "launcher") {
       await turn.onPreparedSelected?.(false);
-      return this.runBrowserTurn(turn);
+      const previousTail = this.managedTurnTail;
+      const { promise: nextTail, resolve: releaseLock } = Promise.withResolvers<void>();
+      this.managedTurnTail = nextTail;
+      try {
+        await withBrowserTurnAbort(previousTail, turn.abortSignal);
+        return await this.runBrowserTurn(turn);
+      } finally {
+        releaseLock();
+      }
     }
 
     const lease = await notifyLauncherTurn(this.config.browserHostDescriptorPath!, {

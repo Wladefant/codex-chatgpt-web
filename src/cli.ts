@@ -27,7 +27,7 @@ import { runCommand } from "./process";
 import { startServer } from "./server";
 import { assertServiceIdle, cancelActiveTurns, getServiceStatus, installService, interruptActiveTurn, restartService, startService, stopService, uninstallService } from "./service";
 import { existingFullSetupCredentials, preflightSetup, setup, type SetupOptions } from "./setup";
-import { installRuntimeKeyBytes, managedRuntimeKeyPath, stopTunnel, tunnelStatus, waitForTunnelReady } from "./tunnel";
+import { connectTunnel, installRuntimeKeyBytes, managedRuntimeKeyPath, stopTunnel, tunnelStatus, waitForTunnelReady } from "./tunnel";
 import { getTunnelServiceStatus, restartTunnelService, startTunnelService, stopTunnelService, uninstallTunnelService } from "./tunnel-service";
 import { VERSION } from "./version";
 import { runDevCommand } from "./dev-chat/cli";
@@ -480,23 +480,28 @@ async function tunnelCommand(args: string[]): Promise<void> {
     return;
   }
   const config = loadConfig();
-  if (action === "start") startTunnelService();
-  else if (action === "restart") {
+  if (action === "start") {
+    if (process.platform === "darwin") startTunnelService();
+    else connectTunnel(config);
+  } else if (action === "restart") {
     await assertServiceIdle(config);
-    await restartTunnelService();
-  }
-  else if (action === "stop") {
+    if (process.platform === "darwin") {
+      await restartTunnelService();
+    } else {
+      stopTunnel(config);
+      connectTunnel(config);
+    }
+  } else if (action === "stop") {
     await assertServiceIdle(config);
-    await stopTunnelService();
+    if (process.platform === "darwin") await stopTunnelService();
     stopTunnel(config);
-  }
-  else if (action !== "status") throw new Error(`Unknown tunnel action: ${action}`);
+  } else if (action !== "status") throw new Error(`Unknown tunnel action: ${action}`);
   const status = action === "start" || action === "restart"
     ? await waitForTunnelReady(config)
     : tunnelStatus(config);
   const service = getTunnelServiceStatus();
   stdout.write(`${JSON.stringify({ service, runtime: status }, null, 2)}\n`);
-  if (action !== "stop" && (!service.running || !status.ok)) process.exitCode = 1;
+  if (action !== "stop" && ((service.supported && !service.running) || !status.ok)) process.exitCode = 1;
 }
 
 async function openCommand(args: string[]): Promise<void> {
@@ -589,6 +594,13 @@ async function main(): Promise<void> {
   } else if (command === "serve") {
     assertNoArgs(args);
     const config = loadConfig();
+    if (config.mode === "full" && !tunnelStatus(config).processRunning) {
+      try {
+        connectTunnel(config);
+      } catch (error) {
+        console.warn(`[chatgpt-web] could not connect tunnel automatically: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
     const server = startServer(config);
     stdout.write(`codex-chatgpt-web ${VERSION} listening on http://${config.host}:${server.port}/v1 (${config.mode})\n`);
     const { promise } = Promise.withResolvers<void>();
