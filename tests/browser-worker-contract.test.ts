@@ -4474,3 +4474,118 @@ test("a stage that spans a system sleep is not charged for the slept time", asyn
   await stage;
   expect(outcome).toEqual(["ChatGPT browser stage timed out: probe"]);
 }, 10_000);
+
+test("managed-turn serialization chains queue when an intermediate turn is aborted", async () => {
+  const provider: CodexProviderConfig = {
+    adapter: "chatgpt-web",
+    baseUrl: `browser://managed-turn-${Date.now()}`,
+    chatgptWeb: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
+  };
+  const worker = ChatGptBrowserWorker.forProvider(provider) as unknown as {
+    config: { browserHost: string };
+    runExclusive(turn: {
+      traceId: string;
+      abortSignal?: AbortSignal;
+      onPreparedSelected?: (selected: boolean) => Promise<void>;
+    }): Promise<string>;
+    runBrowserTurn(turn: { traceId: string }): Promise<string>;
+  };
+  worker.config.browserHost = "managed-chrome";
+
+  let active = 0;
+  let maxActive = 0;
+  const executionOrder: string[] = [];
+  const aStarted = Promise.withResolvers<void>();
+  const aRelease = Promise.withResolvers<void>();
+  const cRelease = Promise.withResolvers<void>();
+
+  worker.runBrowserTurn = async turn => {
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    executionOrder.push(`start:${turn.traceId}`);
+    if (turn.traceId === "turn-A") {
+      aStarted.resolve();
+      await aRelease.promise;
+    } else if (turn.traceId === "turn-C") {
+      await cRelease.promise;
+    }
+    executionOrder.push(`end:${turn.traceId}`);
+    active -= 1;
+    return `result:${turn.traceId}`;
+  };
+
+  const turnA = worker.runExclusive({ traceId: "turn-A" });
+
+  const abortControllerB = new AbortController();
+  const turnB = worker.runExclusive({ traceId: "turn-B", abortSignal: abortControllerB.signal });
+  const turnBError = turnB.catch(error => error);
+
+  // Wait until turn A is actively driving, then abort turn B while it waits on A
+  await aStarted.promise;
+  abortControllerB.abort();
+
+  const turnC = worker.runExclusive({ traceId: "turn-C" });
+
+  // Turn C must not start while turn A is running, even though turn B was aborted
+  expect(executionOrder).toEqual(["start:turn-A"]);
+  expect(maxActive).toBe(1);
+
+  // Release turn A and verify turn B rejects with abort while turn A finishes
+  aRelease.resolve();
+  await expect(turnA).resolves.toBe("result:turn-A");
+  const bErr = await turnBError;
+  expect(bErr).toBeInstanceOf(DOMException);
+  expect((bErr as DOMException).name).toBe("AbortError");
+  // Now turn C can proceed and finish
+  cRelease.resolve();
+  await expect(turnC).resolves.toBe("result:turn-C");
+
+  expect(maxActive).toBe(1);
+  expect(executionOrder).toEqual(["start:turn-A", "end:turn-A", "start:turn-C", "end:turn-C"]);
+});
+
+test("reconcileAssistantTurnBinding allows virtualized prior user turns and rejects foreign turns opened after prompt", async () => {
+  const provider: CodexProviderConfig = {
+    adapter: "chatgpt-web",
+    baseUrl: `browser://turn-reconcile-${Date.now()}`,
+    chatgptWeb: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
+  };
+  const worker = ChatGptBrowserWorker.forProvider(provider) as unknown as {
+    reconcileAssistantTurnBinding(
+      page: unknown,
+      baseline: { initialTurnIdentities: readonly string[]; domCache: Record<string, unknown> },
+      binding: { identity: string; locator: { count(): Promise<number> }; acceptedTurnIdentities: readonly string[] },
+      signal?: AbortSignal,
+    ): Promise<unknown>;
+    submissionDomState: (page: unknown, cache: unknown, signal?: AbortSignal) => Promise<unknown>;
+  };
+
+  const detachedLocator = { count: async () => 0 };
+
+  // Case 1: Prior-history user turn re-rendered before accepted user turn (virtualization) -> does not throw
+  worker.submissionDomState = async () => ({
+    userIdentities: ["user-prior-virtualized", "user-accepted"],
+    responseIdentities: ["resp-rebound"],
+    turnIdentities: ["user-prior-virtualized", "user-accepted", "resp-rebound"],
+  });
+
+  const rebound = await worker.reconcileAssistantTurnBinding(
+    { locator: () => ({ count: async () => 1 }) },
+    { initialTurnIdentities: ["user-accepted"], domCache: {} },
+    { identity: "resp-old", locator: detachedLocator, acceptedTurnIdentities: ["user-accepted"] },
+  );
+  expect(rebound).toMatchObject({ identity: "resp-rebound" });
+
+  // Case 2: New user turn appeared after accepted user turn -> throws
+  worker.submissionDomState = async () => ({
+    userIdentities: ["user-accepted", "user-foreign-new"],
+    responseIdentities: ["resp-rebound"],
+    turnIdentities: ["user-accepted", "user-foreign-new", "resp-rebound"],
+  });
+
+  await expect(worker.reconcileAssistantTurnBinding(
+    { locator: () => ({ count: async () => 1 }) },
+    { initialTurnIdentities: ["user-accepted"], domCache: {} },
+    { identity: "resp-old", locator: detachedLocator, acceptedTurnIdentities: ["user-accepted"] },
+  )).rejects.toThrow("ChatGPT opened another user turn while the bound assistant response was detached");
+});

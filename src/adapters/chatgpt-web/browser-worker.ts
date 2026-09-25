@@ -160,6 +160,12 @@ const CHATGPT_SMOKE_EXPECTED = "CODEX WEB GPT READY";
 export const CHATGPT_UI_SETTLE_MS = 250;
 export const CHATGPT_SEND_ENABLE_GRACE_MS = 5_000;
 
+function delay(ms: number): Promise<void> {
+  const { promise, resolve } = Promise.withResolvers<void>();
+  setTimeout(resolve, ms);
+  return promise;
+}
+
 const CHATGPT_DOM_REVISION_ATTRIBUTES = [
   "aria-hidden",
   "aria-label",
@@ -1336,7 +1342,6 @@ interface ChatGptSubmissionBaseline {
   userTurns: Locator;
   responseTurns: Locator;
   initialTurnIdentities: readonly string[];
-  initialUserTurnCount?: number;
   /** The conversation surface the prompt was attached to, for Node-side navigation evidence. */
   url: string;
   domCache: ChatGptSubmissionDomCache;
@@ -1905,7 +1910,6 @@ const CHATGPT_DIAGNOSTIC_SAFE_STRING_KEYS = new Set([
   "id",
   "className",
   "ariaLabel",
-  "attributes",
 ]);
 
 /** Defense in depth: persisted browser traces contain structure, never rendered UI text. */
@@ -3141,7 +3145,8 @@ export class ChatGptBrowserWorker {
         return candidate.isConnected
           && style.display !== "none"
           && style.visibility !== "hidden"
-          && style.opacity !== "0";
+          && style.opacity !== "0"
+          && (candidate.offsetWidth > 0 || candidate.offsetHeight > 0);
       };
       // data-testid contains a display index: ChatGPT can renumber it while the same turn lives.
       // Virtualization removes a turn's section, but retains its outer identity container.
@@ -3237,7 +3242,6 @@ export class ChatGptBrowserWorker {
       userTurns,
       responseTurns,
       initialTurnIdentities: state.turnIdentities,
-      initialUserTurnCount: state.userTurnCount,
       url: page.url(),
       domCache,
     };
@@ -3310,7 +3314,7 @@ export class ChatGptBrowserWorker {
           );
           observationBaseline.domCache.key = undefined;
           observationBaseline.domCache.snapshot = undefined;
-          await new Promise(resolveSleep => setTimeout(resolveSleep, 250));
+          await withBrowserTurnAbort(delay(250), signal);
           continue;
         }
         if (!chatGptExternalProgressIsLive(latestProgress, Date.now(), graceMs)) throw error;
@@ -3378,9 +3382,22 @@ export class ChatGptBrowserWorker {
     }
     const state = await this.submissionDomState(page, baseline.domCache, signal);
     const acceptedTurns = new Set(binding.acceptedTurnIdentities);
-    const acceptedUserCount = (baseline.initialUserTurnCount ?? 0) + 1;
-    if (state.userTurnCount > acceptedUserCount && state.userIdentities.some(identity => !acceptedTurns.has(identity))) {
-      throw new Error("ChatGPT opened another user turn while the bound assistant response was detached");
+    const unrecognizedUserIdentities = state.userIdentities.filter(identity => !acceptedTurns.has(identity));
+    if (unrecognizedUserIdentities.length > 0) {
+      let lastAcceptedUserIndex = -1;
+      for (let i = state.userIdentities.length - 1; i >= 0; i--) {
+        if (acceptedTurns.has(state.userIdentities[i])) {
+          lastAcceptedUserIndex = i;
+          break;
+        }
+      }
+      const hasNewUserTurnAfterAccepted = unrecognizedUserIdentities.some(identity => {
+        const index = state.userIdentities.indexOf(identity);
+        return lastAcceptedUserIndex === -1 || index > lastAcceptedUserIndex;
+      });
+      if (hasNewUserTurnAfterAccepted) {
+        throw new Error("ChatGPT opened another user turn while the bound assistant response was detached");
+      }
     }
     const identity = chatGptReboundTurnIdentity(
       baseline.initialTurnIdentities,
@@ -3400,14 +3417,6 @@ export class ChatGptBrowserWorker {
     return composer.evaluate((element, pillSelector) => {
       const clone = element.cloneNode(true) as HTMLElement;
       const pills = [...clone.querySelectorAll(pillSelector)];
-      if (pills.length > 1) {
-        const removed = pills.map(p => ({
-          tag: p.tagName,
-          attrs: [...p.attributes].map(a => `${a.name}=${a.value}`).join(" "),
-          text: p.textContent,
-        }));
-        console.warn(`[chatgpt-web] REMOVED_PILLS: count=${pills.length} items=${JSON.stringify(removed.slice(0, 5))}`);
-      }
       pills.forEach(part => part.remove());
       return [...clone.childNodes]
         .map(child => child.textContent ?? "")
@@ -3731,7 +3740,6 @@ export class ChatGptBrowserWorker {
       if (typeof appResult.click === "function") {
         try {
           await appResult.click({
-            force: true,
             timeout: 2_000,
             signal: abortSignal,
           });
@@ -3896,7 +3904,7 @@ export class ChatGptBrowserWorker {
         console.warn(
           `[chatgpt-web] submission accepted observation tolerated timeout ${recoveryAttempts}/${MAX_CHATGPT_RESPONSE_OBSERVATION_TIMEOUTS}: ${error.message}`,
         );
-        await new Promise(resolveSleep => setTimeout(resolveSleep, 250));
+        await withBrowserTurnAbort(delay(250), abortSignal);
         continue;
       }
     }
@@ -3951,6 +3959,9 @@ export class ChatGptBrowserWorker {
       await sendButton.press("Enter", {
         noWaitAfter: true,
         signal: abortSignal,
+        // runStage owns the operation budget. A second Locator timeout would silently collapse the
+        // 180-second Bigger Context budget back to the ordinary 20 seconds after Enter has already
+        // submitted the message; semantic submission evidence below remains the authority.
         timeout: 0,
       });
     }
@@ -4786,7 +4797,7 @@ export class ChatGptBrowserWorker {
       await turn.onPreparedSelected?.(false);
       const previousTail = this.managedTurnTail;
       const { promise: nextTail, resolve: releaseLock } = Promise.withResolvers<void>();
-      this.managedTurnTail = nextTail;
+      this.managedTurnTail = previousTail.catch(() => {}).then(() => nextTail);
       try {
         await withBrowserTurnAbort(previousTail, turn.abortSignal);
         return await this.runBrowserTurn(turn);

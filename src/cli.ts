@@ -594,7 +594,7 @@ async function main(): Promise<void> {
   } else if (command === "serve") {
     assertNoArgs(args);
     const config = loadConfig();
-    if (config.mode === "full" && !tunnelStatus(config).processRunning) {
+    if (config.mode === "full" && !tunnelStatus(config).processRunning && !getTunnelServiceStatus().supported) {
       try {
         connectTunnel(config);
       } catch (error) {
