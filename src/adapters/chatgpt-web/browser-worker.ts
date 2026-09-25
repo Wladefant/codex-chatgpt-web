@@ -3391,9 +3391,14 @@ export class ChatGptBrowserWorker {
           break;
         }
       }
+      const initialTurns = new Set(baseline.initialTurnIdentities);
+      const newSinceBaseline = state.userIdentities.filter(identity => !initialTurns.has(identity));
       const hasNewUserTurnAfterAccepted = unrecognizedUserIdentities.some(identity => {
         const index = state.userIdentities.indexOf(identity);
-        return lastAcceptedUserIndex === -1 || index > lastAcceptedUserIndex;
+        if (lastAcceptedUserIndex === -1) {
+          return newSinceBaseline.length > 1;
+        }
+        return index > lastAcceptedUserIndex;
       });
       if (hasNewUserTurnAfterAccepted) {
         throw new Error("ChatGPT opened another user turn while the bound assistant response was detached");

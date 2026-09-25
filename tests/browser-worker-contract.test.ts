@@ -4588,4 +4588,31 @@ test("reconcileAssistantTurnBinding allows virtualized prior user turns and reje
     { initialTurnIdentities: ["user-accepted"], domCache: {} },
     { identity: "resp-old", locator: detachedLocator, acceptedTurnIdentities: ["user-accepted"] },
   )).rejects.toThrow("ChatGPT opened another user turn while the bound assistant response was detached");
+
+  // Case 3: Prompt user turn was not in acceptedTurnIdentities yet, but only 1 new user turn appeared -> does not throw
+  worker.submissionDomState = async () => ({
+    userIdentities: ["user-submitted-single"],
+    responseIdentities: ["resp-rebound"],
+    turnIdentities: ["user-submitted-single", "resp-rebound"],
+  });
+
+  const reboundUnaccepted = await worker.reconcileAssistantTurnBinding(
+    { locator: () => ({ count: async () => 1 }) },
+    { initialTurnIdentities: [], domCache: {} },
+    { identity: "resp-old", locator: detachedLocator, acceptedTurnIdentities: ["resp-old"] },
+  );
+  expect(reboundUnaccepted).toMatchObject({ identity: "resp-rebound" });
+
+  // Case 4: No user turn in acceptedTurnIdentities yet, but multiple new user turns appeared -> throws
+  worker.submissionDomState = async () => ({
+    userIdentities: ["user-submitted-single", "user-foreign-new"],
+    responseIdentities: ["resp-rebound"],
+    turnIdentities: ["user-submitted-single", "user-foreign-new", "resp-rebound"],
+  });
+
+  await expect(worker.reconcileAssistantTurnBinding(
+    { locator: () => ({ count: async () => 1 }) },
+    { initialTurnIdentities: [], domCache: {} },
+    { identity: "resp-old", locator: detachedLocator, acceptedTurnIdentities: ["resp-old"] },
+  )).rejects.toThrow("ChatGPT opened another user turn while the bound assistant response was detached");
 });
