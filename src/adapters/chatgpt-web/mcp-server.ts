@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
+import { isAbsolute, relative, resolve, toNamespacedPath } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import * as z from "zod/v4";
@@ -111,10 +112,19 @@ function afterSafeStart(contract: ChatGptMcpContract, description: string): stri
     : description;
 }
 
+function pathIdentity(value: string): string {
+  const normalized = resolve(value);
+  return process.platform === "win32" ? toNamespacedPath(normalized).toLowerCase() : normalized;
+}
+
+function contains(root: string, path: string): boolean {
+  const rel = relative(pathIdentity(root), pathIdentity(path));
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
 function wireName(tool: CodexTool): string {
   return namespacedToolName(tool.namespace, tool.name);
 }
-
 function exactTool(environment: ChatGptTurnEnvironment, name: string): CodexTool | undefined {
   return environment.tools.find(tool => !tool.namespace && tool.name === name);
 }
@@ -462,7 +472,7 @@ export async function runChatGptMcpServer(options: {
     try {
       const claimed = await callTurnBroker<Omit<ClaimedTurn, "activityId">>(
         options.brokerSocketPath,
-        { method: "claim", token: turnToken, activityId, contract },
+        { method: "claim", token: turnToken, activityId, contract, tool: toolName },
         contract === "safe" ? null : 5_000,
         extra.signal,
       );
@@ -656,7 +666,9 @@ export async function runChatGptMcpServer(options: {
           ...(yield_time_ms !== undefined ? { timeout_ms: yield_time_ms } : {}),
           ...permissions,
         };
-        const tool = exactTool(bound, "exec_command") ?? exactTool(bound, "shell_command");
+        const tool = exactTool(bound, "exec_command")
+          ?? exactTool(bound, "shell_command")
+          ?? exactTool(bound, "bash");
         if (tool) {
           // Never silently discard an approval request on a native registry that cannot express it.
           const properties = tool.parameters.properties;
@@ -665,7 +677,30 @@ export async function runChatGptMcpServer(options: {
               throw new Error(`The current native ${tool.name} tool does not support ${key}`);
             }
           }
-          const args = tool.name === "exec_command" ? execCommandArguments : shellCommandArguments;
+          let bashArguments: Record<string, unknown> | undefined;
+          if (tool.name === "bash") {
+            let bashCwd: string | undefined;
+            if (workdir) {
+              const resolved = isAbsolute(workdir) ? resolve(workdir) : resolve(bound.cwd, workdir);
+              const roots = bound.roots && bound.roots.length > 0 ? bound.roots : [bound.cwd];
+              if (!roots.some(root => contains(root, resolved))) {
+                throw new Error(`Command workdir escapes workspace roots: ${workdir}`);
+              }
+              bashCwd = resolved;
+            }
+            bashArguments = {
+              command: cmd,
+              ...(bashCwd !== undefined ? { cwd: bashCwd } : {}),
+              ...(yield_time_ms !== undefined ? { backgroundAfter: yield_time_ms / 1000 } : {}),
+              ...(tty !== undefined ? { pty: Boolean(tty) } : {}),
+              ...permissions,
+            };
+          }
+          const args = tool.name === "exec_command"
+            ? execCommandArguments
+            : tool.name === "bash"
+              ? bashArguments!
+              : shellCommandArguments;
           return invoke(claimed.bindingId, bound, tool, { arguments: args }, extra.signal);
         }
         const gateway = execGateway(bound);

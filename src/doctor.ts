@@ -200,6 +200,8 @@ export async function runDoctor(): Promise<DoctorReport> {
             detail: JSON.stringify(tunnelService),
           }
         : { id: "tunnel-service", status: "ok", message: "Launcher owns the tunnel runtime" });
+    } else if (!tunnelService.supported) {
+      checks.push({ id: "tunnel-service", status: "ok", message: "Tunnel runs directly under serve on this platform" });
     } else {
       checks.push(tunnelService.installed && tunnelService.loaded && tunnelService.running
         ? { id: "tunnel-service", status: "ok", message: "macOS tunnel service is installed, loaded, and running" }

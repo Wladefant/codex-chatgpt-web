@@ -130,6 +130,7 @@ interface BrokerRequest {
   surfaceNonce?: string;
   finalAnswer?: string;
   contract?: "native" | "safe";
+  tool?: string;
 }
 
 interface BrokerResponse {
@@ -1015,9 +1016,12 @@ export class TurnBroker implements TurnBrokerOwner {
       let activeChannel = channel && !channel.completionCommitted ? channel : undefined;
       const retiredTurn = channel?.completionCommitted ? channel.traceId : this.retiredTokens.get(token);
       console.error(
-        `[chatgpt-web] broker claim received (tokenChars=${token.length}, tokenHash=${handleFingerprint(token)}, valid=${Boolean(activeChannel)}`
+        `[chatgpt-web] broker claim received tool=${request.tool ?? "unknown"} (tokenChars=${token.length}, tokenHash=${handleFingerprint(token)}, valid=${Boolean(activeChannel)}`
         + `${activeChannel ? "" : `, retiredTurn=${retiredTurn ?? "unknown"}`})`,
       );
+      if (activeChannel) {
+        console.error(`[chatgpt-web] broker claim trace=${activeChannel.traceId} tools=${activeChannel.environment.tools.map(t => t.name).join(",")}`);
+      }
       if (!activeChannel) {
         throw new Error(retiredTurn !== undefined
           ? `${contract === "safe" ? "This request_id" : "This turn_token"} was issued for ${retiredTurnLabel(retiredTurn)}, which has already finished.`
