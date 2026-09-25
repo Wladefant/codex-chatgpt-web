@@ -1336,6 +1336,7 @@ interface ChatGptSubmissionBaseline {
   userTurns: Locator;
   responseTurns: Locator;
   initialTurnIdentities: readonly string[];
+  initialUserTurnCount?: number;
   /** The conversation surface the prompt was attached to, for Node-side navigation evidence. */
   url: string;
   domCache: ChatGptSubmissionDomCache;
@@ -3236,6 +3237,7 @@ export class ChatGptBrowserWorker {
       userTurns,
       responseTurns,
       initialTurnIdentities: state.turnIdentities,
+      initialUserTurnCount: state.userTurnCount,
       url: page.url(),
       domCache,
     };
@@ -3376,7 +3378,7 @@ export class ChatGptBrowserWorker {
     }
     const state = await this.submissionDomState(page, baseline.domCache, signal);
     const acceptedTurns = new Set(binding.acceptedTurnIdentities);
-    const acceptedUserCount = baseline.initialUserTurnCount + 1;
+    const acceptedUserCount = (baseline.initialUserTurnCount ?? 0) + 1;
     if (state.userTurnCount > acceptedUserCount && state.userIdentities.some(identity => !acceptedTurns.has(identity))) {
       throw new Error("ChatGPT opened another user turn while the bound assistant response was detached");
     }

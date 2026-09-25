@@ -130,6 +130,7 @@ interface BrokerRequest {
   surfaceNonce?: string;
   finalAnswer?: string;
   contract?: "native" | "safe";
+  tool?: string;
 }
 
 interface BrokerResponse {
