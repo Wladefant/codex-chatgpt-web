@@ -71,7 +71,13 @@ test("production and DEV setup accept the legitimate default connector name", as
     expect(devResultBase.stderr).not.toMatch(/Unknown.*arguments/);
 
     const prodResult = await runCli([
-      "setup", "--browser-only", "--app-name", CHATGPT_CONNECTOR_NAME, "--acknowledge-unofficial",
+      "setup",
+      "--browser-only",
+      "--app-name",
+      CHATGPT_CONNECTOR_NAME,
+      "--browser-host-descriptor",
+      join(root, "launcher-browser.json"),
+      "--acknowledge-unofficial",
     ], env);
     expect(prodResult.stderr).not.toMatch(/Unknown.*arguments/);
   } finally {

@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -144,7 +145,11 @@ import { packageBrowserSupport, resolveNodeLicense } from "../scripts/package-br
     const root = resolve(import.meta.dir, "..");
     const resolved = resolveNodeLicense(fakeNode, root);
     expect(resolved).not.toBe(unrelatedLicense);
-    expect(resolved).toBe(join(root, "LICENSES", "Node-24-LICENSE.txt"));
+    const nodeMajor = spawnSync(fakeNode, ["--version"], { encoding: "utf8" }).stdout.trim().match(/^v(\d+)/)?.[1];
+    const expectedLicense = nodeMajor && existsSync(join(root, "LICENSES", `Node-${nodeMajor}-LICENSE.txt`))
+      ? join(root, "LICENSES", `Node-${nodeMajor}-LICENSE.txt`)
+      : join(root, "LICENSES", "Node-LICENSE.txt");
+    expect(resolved).toBe(expectedLicense);
 
     // When node is in a bin/ subfolder, its installation root (parent directory) is searched:
     const binDir = join(output, "node-install", "bin");
