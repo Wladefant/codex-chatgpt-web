@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { skillFileTokens, validateSkillFiles } from "./skill-attachments";
 import { chromium, type Browser, type BrowserContext, type Locator, type Page, type Request, type Response } from "playwright-core";
 import {
@@ -1210,6 +1211,8 @@ export const MAX_CHATGPT_RESPONSE_OBSERVATION_TIMEOUTS = 12;
  * so it must fail fast and be polled again instead of holding the whole send stage (#12).
  */
 export const CHATGPT_SUBMISSION_CONFIRMATION_PROBE_TIMEOUT_MS = 1_000;
+/** Budget for one generated-image download. Asset hosts serve multi-megabyte payloads slowly. */
+export const CHATGPT_IMAGE_DOWNLOAD_TIMEOUT_MS = 120_000;
 /**
  * Interval between Node-side submission confirmation probes. Acceptance never waits inside the
  * page: an in-page MutationObserver promise issued across ChatGPT's route change to /c/<id> can
@@ -1389,6 +1392,7 @@ export interface ResolvedBrowserConfig {
   browserHostDescriptorPath?: string;
   browserHelperScriptPath?: string;
   browserDiagnosticsPath?: string;
+  imageOutputPath: string;
   storageStatePath: string;
   chromeExecutablePath: string;
   turnTimeoutMs?: number;
@@ -1781,6 +1785,14 @@ export interface ChatGptVisibleTraceEvent {
   continuation?: boolean;
 }
 
+/** An image rendered inside the answer roots of the observed response DOM. */
+export interface ChatGptResponseDomImage {
+  src: string;
+  alt?: string;
+  width: number;
+  height: number;
+}
+
 interface ChatGptResponseDomSnapshot {
   responsePresent: boolean;
   visibleText: string;
@@ -1789,6 +1801,7 @@ interface ChatGptResponseDomSnapshot {
   completionActionVisible: boolean;
   stoppedThinkingVisible: boolean;
   traceBlocks: ChatGptVisibleTraceBlock[];
+  images: ChatGptResponseDomImage[];
 }
 
 interface ChatGptResponseDomCache {
@@ -1805,6 +1818,7 @@ const absentResponseDomSnapshot = (): ChatGptResponseDomSnapshot => ({
   markdownSegments: [],
   completionActionVisible: false,
   stoppedThinkingVisible: false,
+  images: [],
   traceBlocks: [],
 });
 
@@ -2230,6 +2244,7 @@ export function resolveBrowserConfig(provider: CodexProviderConfig): ResolvedBro
     ...(resolvedBrowserHelperScriptPath ? { browserHelperScriptPath: resolvedBrowserHelperScriptPath } : {}),
     browserDiagnosticsPath,
     storageStatePath: resolve(expandUserPath(configured.storageStatePath?.trim() || join(getConfigDir(), "browser", "storage-state.json"))),
+    imageOutputPath: resolve(expandUserPath(configured.imageOutputPath?.trim() || join(getConfigDir(), "browser", "images"))),
     chromeExecutablePath: resolve(expandUserPath(configured.chromeExecutablePath?.trim() || defaultChromeExecutable())),
     ...(turnTimeoutMs !== undefined ? { turnTimeoutMs } : {}),
     ...(responseStallTimeoutMs !== undefined ? { responseStallTimeoutMs } : {}),
@@ -2246,6 +2261,19 @@ const imageExtensions = new Map([
   ["image/gif", "gif"],
   ["image/webp", "webp"],
 ]);
+
+/**
+ * Renders the Markdown block a completed turn appends for each downloaded answer image.
+ * A failed download becomes visible text rather than a silent loss; the turn itself still succeeds.
+ */
+export function chatGptImageResultMarkdown(
+  results: ReadonlyArray<{ fileUri?: string; error?: string }>,
+): string {
+  const lines = results.map((result, index) => result.fileUri
+    ? `![ChatGPT image ${index + 1}](<${result.fileUri}>)`
+    : `ChatGPT image ${index + 1} download failed: ${result.error}`);
+  return lines.join("\n\n");
+}
 
 export function chatGptImageFilePayloads(images: ChatGptWebPromptImage[]): Array<{ name: string; mimeType: string; buffer: Buffer }> {
   if (images.length > CHATGPT_MAX_INPUT_IMAGES) {
@@ -4420,6 +4448,31 @@ export class ChatGptBrowserWorker {
       const classified = selectChatGptAnswerRoots(allMarkdownRoots, streamingStatusContainers);
       const commentaryRoots = classified.commentaryRoots;
       const renderedRoots = classified.answerRoots;
+      // Generated images and other large media render inside the answer roots but are stripped
+      // from the Markdown stream below. Capture them separately so the turn can persist the bytes
+      // and reference the local files in the final answer. Icons, avatars and citation thumbnails
+      // are small; anything below the dimension floor is UI, not content.
+      const answerImages: ChatGptResponseDomImage[] = [];
+      const seenImageSources = new Set<string>();
+      for (const markdownRoot of renderedRoots) {
+        for (const image of markdownRoot.querySelectorAll("img")) {
+          const src = image.currentSrc || image.getAttribute("src") || "";
+          if (!src.startsWith("http") || seenImageSources.has(src)) continue;
+          if (!renderedInDom(image)) continue;
+          // naturalWidth covers loaded images; the width/height attributes are the fallback for
+          // DOM snapshots and not-yet-decoded images that declare their rendered size.
+          const width = image.naturalWidth || image.clientWidth || Number(image.getAttribute("width")) || 0;
+          const height = image.naturalHeight || image.clientHeight || Number(image.getAttribute("height")) || 0;
+          if (Math.max(width, height) < 256) continue;
+          seenImageSources.add(src);
+          answerImages.push({
+            src,
+            ...(image.alt ? { alt: image.alt } : {}),
+            width,
+            height,
+          });
+        }
+      }
       // CHATGPT_MARKDOWN_CONTENT_BEGIN
       const chatGptMarkdownContent = (markdownRoot: HTMLElement): HTMLElement => {
         const content = markdownRoot.cloneNode(true) as HTMLElement;
@@ -4725,6 +4778,7 @@ export class ChatGptBrowserWorker {
           completionActionVisible: completionAction !== undefined,
           stoppedThinkingVisible,
           traceBlocks,
+          images: answerImages,
         },
       };
     }, {
@@ -4752,6 +4806,41 @@ export class ChatGptBrowserWorker {
       .map(stripChatGptTraceControlSuffix)
       .filter(block => block.text.length > 0 && !isChatGptTraceControl(block));
     return snapshot;
+  }
+
+  /**
+   * Downloads every image the completed answer rendered (ChatGPT image-generation output) into the
+   * configured output directory and returns the joined Markdown lines that reference the local
+   * files. Downloaded through the browser context so authenticated asset hosts work without page
+   * CORS, in parallel because a generated answer can contain several images.
+   */
+  private async downloadResponseImages(
+    page: Page,
+    images: readonly ChatGptResponseDomImage[],
+    traceId: string,
+  ): Promise<string> {
+    mkdirSync(this.config.imageOutputPath, { recursive: true });
+    const results = await Promise.all(images.map(async (image, index) => {
+      try {
+        const response = await page.context().request.get(image.src, {
+          timeout: CHATGPT_IMAGE_DOWNLOAD_TIMEOUT_MS,
+          failOnStatusCode: false,
+        });
+        if (!response.ok()) throw new Error(`HTTP ${response.status()}`);
+        const body = await response.body();
+        const contentType = (response.headers()["content-type"] ?? "").split(";")[0]?.trim().toLowerCase() ?? "";
+        const extension = imageExtensions.get(contentType) ?? (contentType === "image/svg+xml" ? "svg" : "png");
+        const path = join(this.config.imageOutputPath, `chatgpt-image-${traceId}-${index + 1}.${extension}`);
+        atomicWriteFile(path, body);
+        console.info(`[chatgpt-web] browser turn ${traceId} saved answer image ${index + 1} to ${path} (${body.length} bytes)`);
+        return { fileUri: pathToFileURL(path).href };
+      } catch (error) {
+        const message = redactChatGptUiDiagnostic(error instanceof Error ? error.message : String(error));
+        console.error(`[chatgpt-web] browser turn ${traceId} answer image ${index + 1} download failed: ${message}`);
+        return { error: message };
+      }
+    }));
+    return chatGptImageResultMarkdown(results);
   }
 
   private async stalledTurnDiagnostic(page: Page, responseTurn: Locator): Promise<string> {
@@ -5634,6 +5723,16 @@ export class ChatGptBrowserWorker {
               finalText = completed.answer;
             } else {
               finalText = final.markdown;
+            }
+            // Generated images are stripped from the Markdown stream; persist their bytes and
+            // reference the local files so the completed answer and the streamed text stay equal.
+            if (snapshot.images.length > 0) {
+              const imageMarkdown = await this.downloadResponseImages(page, snapshot.images, turn.traceId);
+              if (imageMarkdown) {
+                const block = finalText.trim() ? `\n\n${imageMarkdown}` : imageMarkdown;
+                turn.onTextDelta(block);
+                finalText += block;
+              }
             }
             break;
           }

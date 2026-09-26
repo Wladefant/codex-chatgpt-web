@@ -276,6 +276,8 @@ export interface CodexProviderConfig {
     browserDiagnosticsPath?: string;
     /** Playwright storage-state file created by the explicit browser login. */
     storageStatePath?: string;
+    /** Local directory where images rendered by the completed answer are saved. */
+    imageOutputPath?: string;
     /** System Chrome executable. The runtime never downloads a browser. */
     chromeExecutablePath?: string;
     /** Unix socket bridging the turn-bound MCP capability into outer Codex tools. */
