@@ -1136,6 +1136,10 @@ test("health proves that Codex received a successful augmented model catalog", a
       successful_model_catalog_requests: 0,
       last_successful_model_catalog_request_at: null,
     });
+    expect(await (await fetch(`${endpoint}/health`)).json()).toMatchObject({
+      status: "ok",
+      successful_model_catalog_requests: 0,
+    });
 
     const models = await fetch(`${endpoint}/v1/models`, {
       headers: { authorization: "Bearer test-codex-session" },

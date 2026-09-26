@@ -829,7 +829,7 @@ export function startServer(
     idleTimeout: 0,
     async fetch(req) {
       const url = new URL(req.url);
-      if (req.method === "GET" && url.pathname === "/healthz") {
+      if (req.method === "GET" && (url.pathname === "/healthz" || url.pathname === "/health")) {
         return Response.json({
           status: "ok",
           service: "codex-chatgpt-web",
