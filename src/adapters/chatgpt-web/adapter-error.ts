@@ -91,3 +91,16 @@ export function chatGptResponseUnobservableError(message: string, cause?: unknow
     cause,
   });
 }
+
+export function chatGptResponseStalledError(
+  message = "ChatGPT stopped responding after the task started. Check the ChatGPT tab before continuing.",
+  cause?: unknown,
+): ChatGptWebAdapterError {
+  return new ChatGptWebAdapterError(message, {
+    status: 504,
+    errorType: "server_error",
+    code: "chatgpt_response_stalled",
+    retryable: true,
+    cause,
+  });
+}

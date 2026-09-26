@@ -141,6 +141,8 @@ export const CHATGPT_COMPLETION_SETTLE_MS = 2_000;
 export const CHATGPT_COMPLETION_QUIESCENCE_MS = 12_000;
 /** How often a turn still missing completion evidence reports what it is waiting for. */
 export const CHATGPT_RESPONSE_STALL_REPORT_INTERVAL_MS = 60_000;
+/** How long without observable text or trace progress before an in-flight response is considered stalled. */
+export const CHATGPT_RESPONSE_STALL_TIMEOUT_MS = 180_000;
 export const CHATGPT_TOOL_CONFIRMATION_TIMEOUT_MS = 60_000;
 export const MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS = 3;
 const CHATGPT_CONNECTOR_MENTION_QUERY = "@codex";
@@ -2191,6 +2193,7 @@ export function resolveBrowserConfig(provider: CodexProviderConfig): ResolvedBro
     configured.browserDiagnosticsPath?.trim() || join(getConfigDir(), "diagnostics", "browser-turns"),
   ));
   const turnTimeoutMs = configured.turnTimeoutMs;
+  const responseStallTimeoutMs = configured.responseStallTimeoutMs;
   if (browserHost === "launcher" && !browserHostDescriptorPath) {
     throw new Error("Launcher browser host requires chatgptWeb.browserHostDescriptorPath");
   }
@@ -2229,6 +2232,7 @@ export function resolveBrowserConfig(provider: CodexProviderConfig): ResolvedBro
     storageStatePath: resolve(expandUserPath(configured.storageStatePath?.trim() || join(getConfigDir(), "browser", "storage-state.json"))),
     chromeExecutablePath: resolve(expandUserPath(configured.chromeExecutablePath?.trim() || defaultChromeExecutable())),
     ...(turnTimeoutMs !== undefined ? { turnTimeoutMs } : {}),
+    ...(responseStallTimeoutMs !== undefined ? { responseStallTimeoutMs } : {}),
     ...(helperReadyTimeoutMs !== undefined ? { helperReadyTimeoutMs } : {}),
     ...(helperReadyMaxTimeoutMs !== undefined ? { helperReadyMaxTimeoutMs } : {}),
     headed: configured.headed !== false,
@@ -5391,6 +5395,9 @@ export class ChatGptBrowserWorker {
       let lastStallReportAt = 0;
       let capturedResponse = false;
       const sentAt = Date.now();
+      let lastProgressAt = sentAt;
+      let lastVisibleText = "";
+      let lastTraceBlocksCount = 0;
       const visibleTrace = new ChatGptVisibleTraceTracker();
       const markdownBuffer = new ChatGptMarkdownBuffer();
       const checkpointStream = turn.captureLunaCheckpoint
@@ -5524,6 +5531,9 @@ export class ChatGptBrowserWorker {
           Date.now(),
         );
         const externalToolCallsInFlight = chatGptExternalToolCallsAreInFlight(externalProgressSnapshot);
+        if (externalProgressLive || externalToolCallsInFlight) {
+          lastProgressAt = Date.now();
+        }
         if (!snapshot.responsePresent && externalProgressLive) {
           // Current-turn MCP activity proves that ChatGPT is still executing even if its renderer
           // temporarily cannot expose the response subtree. DOM remains authoritative for text and
@@ -5547,6 +5557,14 @@ export class ChatGptBrowserWorker {
               return throwMarkdownConsistencyError(error);
             }
           })();
+          if (snapshot.visibleText !== lastVisibleText) {
+            lastVisibleText = snapshot.visibleText;
+            lastProgressAt = Date.now();
+          }
+          if (snapshot.traceBlocks.length !== lastTraceBlocksCount) {
+            lastTraceBlocksCount = snapshot.traceBlocks.length;
+            lastProgressAt = Date.now();
+          }
           for (const trace of visibleTrace.observe(snapshot.traceBlocks, snapshot.completionActionVisible)) {
             if (trace.kind === "commentary") turn.onCommentary?.(trace.text, trace.continuation === true);
             else turn.onReasoningSummary?.(trace.text, trace.continuation === true);

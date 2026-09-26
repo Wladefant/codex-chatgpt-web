@@ -4616,3 +4616,16 @@ test("reconcileAssistantTurnBinding allows virtualized prior user turns and reje
     { identity: "resp-old", locator: detachedLocator, acceptedTurnIdentities: ["resp-old"] },
   )).rejects.toThrow("ChatGPT opened another user turn while the bound assistant response was detached");
 });
+
+test("stall detection marks response stall retryable and specifies stall duration", () => {
+  const { chatGptResponseStalledError } = require("../src/adapters/chatgpt-web/adapter-error");
+  const { CHATGPT_RESPONSE_STALL_TIMEOUT_MS } = require("../src/adapters/chatgpt-web/browser-worker");
+
+  expect(CHATGPT_RESPONSE_STALL_TIMEOUT_MS).toBe(180_000);
+
+  const error = chatGptResponseStalledError("ChatGPT stopped responding after 180s (180s since last progress).");
+  expect(error.code).toBe("chatgpt_response_stalled");
+  expect(error.status).toBe(504);
+  expect(error.retryable).toBe(true);
+  expect(error.message).toContain("stopped responding");
+});

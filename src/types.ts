@@ -286,6 +286,8 @@ export interface CodexProviderConfig {
     lunaCheckpointStatePath?: string;
     /** Optional explicit safety ceiling. Browser turns have no absolute deadline by default. */
     turnTimeoutMs?: number;
+    /** How long without observable text or trace progress before an in-flight response is considered stalled. */
+    responseStallTimeoutMs?: number;
     /** Activity window in milliseconds before native browser helper process start times out without progress. */
     helperReadyTimeoutMs?: number;
     /** Hard upper bound in milliseconds for native browser helper process start readiness. */
