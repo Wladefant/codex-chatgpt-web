@@ -88,6 +88,7 @@ import {
   chatGptRetainedConversationUnavailableError,
   chatGptResponseUnobservableError,
   chatGptStoppedThinkingError,
+  chatGptResponseStalledError,
 } from "./adapter-error";
 import {
   ChatGptLunaCheckpointStream,
@@ -1392,6 +1393,7 @@ export interface ResolvedBrowserConfig {
   storageStatePath: string;
   chromeExecutablePath: string;
   turnTimeoutMs?: number;
+  responseStallTimeoutMs?: number;
   helperReadyTimeoutMs?: number;
   helperReadyMaxTimeoutMs?: number;
   headed: boolean;
@@ -5646,6 +5648,15 @@ export class ChatGptBrowserWorker {
             externalProgressLive,
           });
           if (domError) throw new Error(domError);
+        }
+        const stallTimeoutMs = this.config.responseStallTimeoutMs ?? CHATGPT_RESPONSE_STALL_TIMEOUT_MS;
+        const silenceSinceProgressMs = Date.now() - lastProgressAt;
+        if (stallTimeoutMs !== undefined && silenceSinceProgressMs >= stallTimeoutMs) {
+          const stallSec = Math.round(silenceSinceProgressMs / 1000);
+          await diagnostics.capture(page, `response-stalled-${stallSec}s`);
+          throw chatGptResponseStalledError(
+            `ChatGPT stopped responding after ${stallSec}s (${stallSec}s since last progress).`,
+          );
         }
         const waitingMs = Date.now() - sentAt;
         // Report for as long as the turn waits, and whether or not a response DOM is present. The
