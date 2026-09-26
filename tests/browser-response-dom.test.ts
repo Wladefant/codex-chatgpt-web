@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { createContext, runInContext } from "node:vm";
 import type { Locator } from "playwright-core";
-import { ChatGptBrowserWorker, ChatGptCompletionTracker, CHATGPT_COMPLETION_SETTLE_MS } from "../src/adapters/chatgpt-web/browser-worker";
+import { ChatGptBrowserWorker, ChatGptCompletionTracker, CHATGPT_COMPLETION_SETTLE_MS, chatGptImageResultMarkdown } from "../src/adapters/chatgpt-web/browser-worker";
 import { ChatGptMarkdownBuffer, type ChatGptMarkdownSegment } from "../src/adapters/chatgpt-web/markdown";
 
 const smokeHtml = readFileSync(new URL("./fixtures/chatgpt-dil-smoke.html", import.meta.url), "utf8");
@@ -13,6 +13,7 @@ type Snapshot = {
   markdownSegments: ChatGptMarkdownSegment[];
   completionActionVisible: boolean;
   traceBlocks: { kind: string; text: string }[];
+  images: { src: string; alt?: string; width: number; height: number }[];
 };
 
 // Execute the production page callback, with only missing Domino browser APIs supplied.
@@ -107,4 +108,26 @@ test("DIL response extraction preserves ownership, commentary and completion bou
   const noCopy = await snapshot(smokeHtml.replace('data-testid="copy-turn-action-button"', 'data-testid="other-action"'));
   expect(noCopy.visibleText).toBe("CODEX WEB GPT READY");
   expect(noCopy.completionActionVisible).toBeFalse();
+});
+
+test("answer images are captured from the response DOM and small or non-http media is ignored", async () => {
+  const html = '<section id="turn"><div class="markdown"><p>CODEX WEB GPT READY</p>'
+    + '<img src="https://files.oaiusercontent.com/generated.png" alt="A generated design" width="1024" height="768">'
+    + '<img src="https://cdn.oaiusercontent.com/icon.png" width="16" height="16">'
+    + '<img src="data:image/png;base64,AAAA" width="512" height="512">'
+    + '<img src="https://files.oaiusercontent.com/generated.png" width="1024" height="768">'
+    + '</div><button data-testid="copy-turn-action-button"></button></section>';
+  const response = await snapshot(html);
+  expect(response.images).toEqual([
+    { src: "https://files.oaiusercontent.com/generated.png", alt: "A generated design", width: 1024, height: 768 },
+  ]);
+});
+
+test("image result markdown renders local references and visible download failures", () => {
+  expect(chatGptImageResultMarkdown([
+    { fileUri: "file:///C:/answers/images/chatgpt-image-t1-1.png" },
+    { error: "HTTP 403" },
+  ])).toBe("![ChatGPT image 1](<file:///C:/answers/images/chatgpt-image-t1-1.png>)\n\n"
+    + "ChatGPT image 2 download failed: HTTP 403");
+  expect(chatGptImageResultMarkdown([])).toBe("");
 });
