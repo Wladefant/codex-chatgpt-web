@@ -20,6 +20,24 @@ if [[ "$(bun --version)" != "$bun_version" ]]; then
 fi
 
 bun install --frozen-lockfile
-bun install --cwd launcher --frozen-lockfile
+(
+  cd launcher
+  bun install --frozen-lockfile
+)
+
 node --test ci/cloudflare/worker.test.mjs
-bun run verify
+bun run check-version
+bun run typecheck
+bun run test
+bun run launcher:typecheck
+bun run launcher:test
+bun run launcher:build
+
+scratch="$(mktemp -d)"
+readonly scratch
+trap 'rm -rf "$scratch"' EXIT
+readonly runtime_bundle="$scratch/runtime"
+
+bun run scripts/build-runtime-bundle.ts "$runtime_bundle"
+bun run scripts/generate-third-party-notices.ts "$scratch/THIRD_PARTY_NOTICES.txt" --include-launcher
+bun run scripts/smoke-release.ts "$runtime_bundle"
