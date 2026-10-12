@@ -32,6 +32,7 @@ bun run test
 bun run launcher:typecheck
 bun run launcher:test
 bun run launcher:build
+bun run launcher:audit
 
 scratch="$(mktemp -d)"
 readonly scratch
@@ -41,3 +42,4 @@ readonly runtime_bundle="$scratch/runtime"
 bun run scripts/build-runtime-bundle.ts "$runtime_bundle"
 bun run scripts/generate-third-party-notices.ts "$scratch/THIRD_PARTY_NOTICES.txt" --include-launcher
 bun run scripts/smoke-release.ts "$runtime_bundle"
+bun run audit
