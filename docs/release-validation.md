@@ -1,9 +1,11 @@
 # Release validation
 
-CI proves that the runtime builds, the launcher starts, and native packages pass their smoke
-contract on macOS, Windows, and Linux. It does not prove an authenticated ChatGPT session, a live
-MCP connector, or a complete Codex turn. A release candidate is not ready until those account-bound
-flows are exercised manually on the platforms below.
+CI builds and tests the runtime on Linux only. CI does not build or smoke-test native macOS or
+Windows packages. It does not prove an authenticated ChatGPT session, a live MCP connector, or a
+complete Codex turn. Validate native packages and account-bound flows manually before release.
+Automated releases publish Linux runtime and Linux package artifacts only. They no longer publish
+macOS or Windows runtime archives, installers, or signed application packages. No Linux cross-build
+for those native formats has been proven, so the release workflow drops them.
 
 ## Required evidence
 

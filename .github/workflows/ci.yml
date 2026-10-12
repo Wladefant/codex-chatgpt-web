@@ -10,38 +10,15 @@ permissions:
 
 jobs:
   verify:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-15, ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - name: Validate launcher installer with Windows PowerShell 5.1
-        if: runner.os == 'Windows'
-        shell: powershell
-        run: |
-          if ($PSVersionTable.PSVersion.Major -ne 5) {
-            throw "Expected Windows PowerShell 5.1, got $($PSVersionTable.PSVersion)"
-          }
-          $source = Get-Content scripts/install-launcher.ps1 -Raw
-          [void][scriptblock]::Create($source)
-          if ($source.Contains("IsPathFullyQualified")) {
-            throw "The Windows PowerShell 5.1 installer cannot use the .NET Core-only IsPathFullyQualified API"
-          }
-          if (-not [Environment]::Is64BitOperatingSystem) {
-            throw "The Windows CI runner must be 64-bit"
-          }
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.0
       - run: bun install --frozen-lockfile
       - run: bun install --frozen-lockfile
         working-directory: launcher
-      - name: Prepare AVX2-independent Windows runtime
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: ./scripts/prepare-windows-baseline-bun.ps1 -Version 1.4.0 -GitHubEnv $env:GITHUB_ENV
       - name: Prepare compatible Linux libnotify
         if: runner.os == 'Linux'
         run: |

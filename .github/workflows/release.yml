@@ -9,19 +9,7 @@ permissions:
 
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-15
-            runtime_asset: codex-chatgpt-web-darwin-arm64.tar.gz
-          - runner: macos-15-intel
-            runtime_asset: codex-chatgpt-web-darwin-amd64.tar.gz
-          - runner: ubuntu-latest
-            runtime_asset: codex-chatgpt-web-linux-amd64.tar.gz
-          - runner: windows-latest
-            runtime_asset: codex-chatgpt-web-windows-amd64.zip
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: oven-sh/setup-bun@v2
@@ -30,10 +18,6 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun install --frozen-lockfile
         working-directory: launcher
-      - name: Prepare AVX2-independent Windows runtime
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: ./scripts/prepare-windows-baseline-bun.ps1 -Version 1.4.0 -GitHubEnv $env:GITHUB_ENV
       - name: Prepare compatible Linux libnotify
         if: runner.os == 'Linux'
         run: |
@@ -56,32 +40,13 @@ jobs:
         if: runner.os == 'Linux'
         run: command -v xvfb-run || (sudo apt-get update && sudo apt-get install -y xvfb)
       - run: bun run app:smoke
-      - name: Verify embedded macOS runtime signature
-        if: runner.os == 'macOS'
-        run: codesign --verify --deep --strict launcher/build/runtime/runtime/bun
-      - name: Verify packaged macOS application signature
-        if: runner.os == 'macOS'
-        run: |
-          archive="$(find launcher/artifacts -maxdepth 1 -name '*-mac-*.zip' -print -quit)"
-          test -n "$archive"
-          stage="$(mktemp -d)"
-          ditto -x -k "$archive" "$stage"
-          codesign --verify --deep --strict --verbose=2 "$stage/Codex Web GPT.app"
-      - name: Archive runtime
-        if: runner.os != 'Windows'
-        run: tar -czf "${{ matrix.runtime_asset }}" -C launcher/build/runtime .
-      - name: Archive Windows runtime
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: Compress-Archive -Path launcher/build/runtime/* -DestinationPath "${{ matrix.runtime_asset }}"
+      - name: Archive Linux runtime
+        run: tar -czf codex-chatgpt-web-linux-amd64.tar.gz -C launcher/build/runtime .
       - uses: actions/upload-artifact@v4
         with:
-          name: release-${{ matrix.runner }}
+          name: release-linux-amd64
           path: |
-            ${{ matrix.runtime_asset }}
-            launcher/artifacts/*.dmg
-            launcher/artifacts/*.zip
-            launcher/artifacts/*.exe
+            codex-chatgpt-web-linux-amd64.tar.gz
             launcher/artifacts/*.AppImage
           if-no-files-found: error
 
@@ -105,7 +70,7 @@ jobs:
         run: |
           expected="v$(jq -r .version package.json)"
           test "$GITHUB_REF_NAME" = "$expected"
-      - name: Add licenses and installers
+      - name: Add licenses and Linux installers
         run: |
           cp LICENSE release-assets/LICENSE
           cp LICENSES/Bun-1.4.0.md release-assets/Bun-1.4.0.md
@@ -113,7 +78,6 @@ jobs:
           cp dist/THIRD_PARTY_NOTICES.txt release-assets/THIRD_PARTY_NOTICES.txt
           cp scripts/install.sh release-assets/install.sh
           cp scripts/install-launcher.sh release-assets/install-launcher.sh
-          cp scripts/install-launcher.ps1 release-assets/install-launcher.ps1
       - name: Flatten release assets
         run: |
           cd release-assets
