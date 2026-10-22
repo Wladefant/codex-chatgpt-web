@@ -12,6 +12,7 @@ import {
   activateChatGptEffortMenu,
   chatGptTurnLocatorSelector,
   detectChatGptAccountCapabilities,
+  assertAuthenticatedChatGptPage,
 } from "../src/chatgpt-session";
 
 test("composer and effort selectors exclude unrelated editable fields and menu buttons", () => {
@@ -186,6 +187,92 @@ test("effort activation fails closed when neither event exposes a structural sur
     .rejects.toThrow("did not expose its owned menu or structural slider");
 });
 
+test("ChatGPT session endpoint distinguishes valid, guest, expired, malformed, and redirected sessions", async () => {
+  const sessionResponse: {
+    ok: boolean;
+    status: number;
+    url: string;
+    contentType: string;
+    json: () => Promise<unknown>;
+  } = {
+    ok: true,
+    status: 200,
+    url: "https://chatgpt.com/api/auth/session",
+    contentType: "application/json",
+    json: async () => ({
+      user: { id: "fixture" },
+      error: "unauthenticated",
+      expires: "2099-01-01T00:00:00Z",
+    }),
+  };
+  const composer = {
+    filter() { return this; },
+    count: async () => 1,
+    nth() { return this; },
+    isVisible: async () => true,
+  };
+  const page = {
+    url: () => "https://chatgpt.com/?temporary-chat=true",
+    locator: () => composer,
+    evaluate: async (callback: () => Promise<unknown>) => await callback(),
+  };
+  const previousFetch = globalThis.fetch;
+  const previousLocation = Object.getOwnPropertyDescriptor(globalThis, "location");
+  globalThis.fetch = async () => ({
+    ok: sessionResponse.ok,
+    status: sessionResponse.status,
+    url: sessionResponse.url,
+    headers: { get: () => sessionResponse.contentType },
+    json: sessionResponse.json,
+  } as Response);
+  Object.defineProperty(globalThis, "location", {
+    configurable: true,
+    value: { href: "https://chatgpt.com/?temporary-chat=true", origin: "https://chatgpt.com" },
+  });
+  try {
+    await expect(assertAuthenticatedChatGptPage(page as never))
+      .rejects.toThrow("ChatGPT authentication could not be verified");
+
+    sessionResponse.json = async () => ({
+      user: { id: "fixture" },
+      expires: "2099-01-01T00:00:00Z",
+    });
+    await expect(assertAuthenticatedChatGptPage(page as never)).resolves.toBeUndefined();
+
+    sessionResponse.json = async () => ({
+      user: { id: "fixture" },
+      expires: "2000-01-01T00:00:00Z",
+    });
+    await expect(assertAuthenticatedChatGptPage(page as never))
+      .rejects.toThrow("ChatGPT authentication could not be verified");
+
+    sessionResponse.json = async () => ({
+      user: { id: "fixture" },
+      error: "expired",
+    });
+    await expect(assertAuthenticatedChatGptPage(page as never))
+      .rejects.toThrow("ChatGPT authentication could not be verified");
+
+    sessionResponse.json = async () => { throw new SyntaxError("private response"); };
+    await expect(assertAuthenticatedChatGptPage(page as never))
+      .rejects.toThrow("ChatGPT authentication could not be verified");
+
+    sessionResponse.json = async () => ({ user: { id: "fixture" } });
+    sessionResponse.url = "https://example.com/api/auth/session";
+    await expect(assertAuthenticatedChatGptPage(page as never))
+      .rejects.toThrow("ChatGPT authentication could not be verified");
+
+    sessionResponse.url = "https://chatgpt.com/api/auth/session";
+    sessionResponse.status = 401;
+    sessionResponse.ok = false;
+    await expect(assertAuthenticatedChatGptPage(page as never))
+      .rejects.toThrow("ChatGPT authentication could not be verified");
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousLocation) Object.defineProperty(globalThis, "location", previousLocation);
+    else delete (globalThis as typeof globalThis & { location?: Location }).location;
+  }
+});
 test("a complete authenticated composer with no effort selector is Luna-only", async () => {
   const effortButton = {
     last() { return this; },
