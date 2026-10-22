@@ -1,0 +1,42 @@
+name: OVH CI
+
+on:
+  push:
+    branches-ignore:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  codexchatgpt-ci:
+    name: codexchatgpt-ci
+    runs-on: [self-hosted, Linux, X64, ovh, codexchatgpt]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+      - name: Run related tests and release checks
+        run: bash ci/cloudflare/run.sh 2>&1 | tee ovh-ci.log
+      - name: Summarize
+        if: always()
+        run: |
+          {
+            echo "### codexchatgpt-ci"
+            echo "- commit: ${GITHUB_SHA}"
+            echo "- counts:"
+            grep -E '^# (tests|pass|fail) |^ok |^not ok | pass$| fail$|^ [0-9]+ (pass|fail)' ovh-ci.log | tail -n 30 || true
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ovh-ci-log
+          path: ovh-ci.log
+          if-no-files-found: ignore
