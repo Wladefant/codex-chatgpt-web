@@ -209,11 +209,45 @@ async function anyVisible(locator: Locator): Promise<boolean> {
 }
 
 export async function assertAuthenticatedChatGptPage(page: Page): Promise<void> {
-  const composer = page.locator(
-    CHATGPT_COMPOSER_SELECTOR,
-  );
+  const composer = page.locator(CHATGPT_COMPOSER_SELECTOR);
   if (!await anyVisible(composer)) {
     throw new Error("ChatGPT authentication could not be verified: no visible composer is present");
+  }
+  const sessionAuthenticated = await page.evaluate(async () => {
+    const pageUrl = new URL(location.href);
+    if (pageUrl.origin !== "https://chatgpt.com") return false;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5_000);
+    try {
+      const response = await fetch("/api/auth/session", {
+        credentials: "include",
+        cache: "no-store",
+        headers: { accept: "application/json" },
+        signal: controller.signal,
+      });
+      const responseUrl = new URL(response.url);
+      if (responseUrl.origin !== pageUrl.origin || responseUrl.pathname !== "/api/auth/session") return false;
+      if (response.status === 401 || !response.ok
+        || !response.headers.get("content-type")?.includes("application/json")) return false;
+      const payload: unknown = await response.json();
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
+      const session = payload as { user?: unknown; error?: unknown; expires?: unknown };
+      const user = session.user;
+      if (!user || typeof user !== "object" || Array.isArray(user) || Object.keys(user).length === 0) return false;
+      if (session.error !== undefined && session.error !== null && session.error !== "") return false;
+      if (session.expires !== undefined && session.expires !== null
+        && (typeof session.expires !== "string"
+          || !Number.isFinite(Date.parse(session.expires))
+          || Date.parse(session.expires) <= Date.now())) return false;
+      return true;
+    } catch {
+      return false;
+    } finally {
+      clearTimeout(timeout);
+    }
+  });
+  if (!sessionAuthenticated) {
+    throw new Error("ChatGPT authentication could not be verified: no valid signed-in session is present");
   }
 }
 
