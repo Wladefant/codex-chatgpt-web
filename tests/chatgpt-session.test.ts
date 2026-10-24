@@ -239,6 +239,10 @@ test("ChatGPT session endpoint distinguishes valid, guest, expired, malformed, a
     });
     const visibleComposerCount = composer.count;
     composer.count = async () => 0;
+    sessionResponse.json = async () => ({
+      user: { id: "fixture" },
+      error: "unauthenticated",
+    });
     await expect(assertAuthenticatedChatGptPage(page as never))
       .rejects.toThrow("no valid signed-in session is present");
     sessionResponse.json = async () => ({
