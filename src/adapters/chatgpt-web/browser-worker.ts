@@ -1910,6 +1910,13 @@ export function stripChatGptTraceControlSuffix(block: ChatGptVisibleTraceBlock):
 
 export function redactChatGptUiDiagnostic(value: string): string {
   return value
+    .replace(/\b(?:https?|wss?|ftp):\/\/[^\s"'<>]+/gi, "[redacted-url]")
+    .replace(/\bBearer\s+[^\s,;]+/gi, "Bearer [redacted]")
+    .replace(
+      /(\b(?:access[_-]?token|refresh[_-]?token|id[_-]?token|token|(?:x-)?api[_-]?key|key|secret|password|passwd|authorization)\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;&]+)/gi,
+      "$1[redacted]",
+    )
+    .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "[redacted-email]")
     .replace(/<codex_context_json>[\s\S]*?<\/codex_context_json>/gi, "<codex_context_json>[redacted]</codex_context_json>")
     .replace(/\b(turn|binding|call)_[A-Za-z0-9_-]{12,}\b/g, "$1_[redacted]");
 }
@@ -1925,7 +1932,7 @@ interface ChatGptDiagnosticErrorRecord {
 }
 
 const CHATGPT_DIAGNOSTIC_CAUSE_LIMIT = 4;
-const CHATGPT_DIAGNOSTIC_CAUSE_MESSAGE_LIMIT = 500;
+const CHATGPT_DIAGNOSTIC_MESSAGE_LIMIT = 500;
 
 function serializeChatGptDiagnosticCause(value: unknown): ChatGptDiagnosticCauseEntry[] | undefined {
   const causes: ChatGptDiagnosticCauseEntry[] = [];
@@ -1935,7 +1942,7 @@ function serializeChatGptDiagnosticCause(value: unknown): ChatGptDiagnosticCause
     seen.add(current);
     causes.push({
       name: /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(current.name) ? current.name : "Error",
-      message: redactChatGptUiDiagnostic(current.message).slice(0, CHATGPT_DIAGNOSTIC_CAUSE_MESSAGE_LIMIT),
+      message: redactChatGptUiDiagnostic(current.message).slice(0, CHATGPT_DIAGNOSTIC_MESSAGE_LIMIT),
     });
     current = current.cause;
   }
@@ -1947,7 +1954,7 @@ export function serializeChatGptDiagnosticError(value: unknown): ChatGptDiagnost
   const isError = value instanceof Error;
   const cause = isError ? serializeChatGptDiagnosticCause(value.cause) : undefined;
   return {
-    error: redactChatGptUiDiagnostic(isError ? value.message : String(value)),
+    error: redactChatGptUiDiagnostic(isError ? value.message : String(value)).slice(0, CHATGPT_DIAGNOSTIC_MESSAGE_LIMIT),
     ...(cause ? { cause } : {}),
   };
 }
@@ -2991,11 +2998,8 @@ export class ChatGptBrowserWorker {
           );
           await diagnostics.capture(page, "security-challenge-remains");
         }
-      } catch (captureError) {
-        console.warn(
-          `[chatgpt-web] security challenge diagnostic capture failed:`
-          + ` ${captureError instanceof Error ? captureError.message : String(captureError)}`,
-        );
+      } catch {
+        console.warn("[chatgpt-web] security challenge diagnostic capture failed");
       }
       throw new ChatGptWebAdapterError(
         "ChatGPT still shows a Cloudflare or Turnstile security challenge after waiting. Complete verification in the same Codex Web GPT bridge profile, then run `codex-chatgpt-web login` again. This turn stopped without interacting with the challenge.",

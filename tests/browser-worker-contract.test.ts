@@ -2927,16 +2927,25 @@ test("a failing challenge diagnostic does not mask the security challenge error"
     ): Promise<unknown>;
   };
 
-  await expect(worker.prepareTemporaryChatSurface(
-    page,
-    async () => { throw new Error("diagnostic write failed"); },
-    { timeoutMs: 0, pollMs: 1 },
-  )).rejects.toMatchObject({
-    name: "ChatGptWebAdapterError",
-    status: 403,
-    code: "chatgpt_security_challenge",
-    retryable: false,
-  });
+  const originalWarn = console.warn;
+  const warnings: string[] = [];
+  console.warn = (...values) => { warnings.push(values.map(String).join(" ")); };
+  try {
+    await expect(worker.prepareTemporaryChatSurface(
+      page,
+      async () => { throw new Error("diagnostic write failed"); },
+      { timeoutMs: 0, pollMs: 1 },
+    )).rejects.toMatchObject({
+      name: "ChatGptWebAdapterError",
+      status: 403,
+      code: "chatgpt_security_challenge",
+      retryable: false,
+    });
+  } finally {
+    console.warn = originalWarn;
+  }
+  expect(warnings.join(" ")).toContain("security challenge diagnostic capture failed");
+  expect(warnings.join(" ")).not.toContain("diagnostic write failed");
 });
 
 
