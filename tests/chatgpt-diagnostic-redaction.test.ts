@@ -21,3 +21,12 @@ test("diagnostic causes redact URL secrets, emails, and bearer tokens", () => {
   expect(record?.cause?.[0]?.message).not.toContain("user@example.test");
   expect(serializeChatGptDiagnosticError(new Error("x".repeat(800)))?.error).toHaveLength(500);
 });
+test("diagnostic messages redact JSON-quoted, underscore, and Basic authorization secrets", () => {
+  const record = serializeChatGptDiagnosticError(new Error(
+    `payload {"access_token":"json-secret"} session_token=session-secret client_secret=client-secret oauth_token=oauth-secret Authorization: Basic basic-secret`,
+  ));
+  const serialized = JSON.stringify(record);
+  for (const secret of ["json-secret", "session-secret", "client-secret", "oauth-secret", "basic-secret"]) {
+    expect(serialized).not.toContain(secret);
+  }
+});

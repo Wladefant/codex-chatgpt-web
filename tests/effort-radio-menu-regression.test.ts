@@ -2,17 +2,29 @@ import { expect, test } from "bun:test";
 import { ChatGptBrowserWorker, serializeChatGptDiagnosticError } from "../src/adapters/chatgpt-web/browser-worker";
 
 test("effort selection chooses High from the captured three-radio menu without a slider", async () => {
-  const state = { open: false, selected: "Medium" };
+  const state = { open: false, selected: "Medium", radioItemsReady: false };
+  const radioItemsAvailable = Promise.withResolvers<void>();
   const radios = ["Low", "Medium", "High"].map(name => ({
     name,
     getAttribute: async (attribute: string) => attribute === "aria-checked" ? String(state.selected === name) : null,
     click: async () => { state.selected = name; },
+    waitFor: async ({ state: waitState }: { state: string }) => {
+      expect(waitState).toBe("visible");
+      if (!state.radioItemsReady) {
+        queueMicrotask(() => {
+          state.radioItemsReady = true;
+          radioItemsAvailable.resolve();
+        });
+      }
+      await radioItemsAvailable.promise;
+    },
   }));
   const radioList = {
-    count: async () => radios.length,
+    count: async () => state.radioItemsReady ? radios.length : 0,
     nth: (index: number) => radios[index],
     filter() { return this; },
     getByRole: () => radioList,
+    waitFor: async () => {},
   };
   const menu = {
     last() { return this; },

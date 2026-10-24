@@ -1913,7 +1913,11 @@ export function redactChatGptUiDiagnostic(value: string): string {
     .replace(/\b(?:https?|wss?|ftp):\/\/[^\s"'<>]+/gi, "[redacted-url]")
     .replace(/\bBearer\s+[^\s,;]+/gi, "Bearer [redacted]")
     .replace(
-      /(\b(?:access[_-]?token|refresh[_-]?token|id[_-]?token|token|(?:x-)?api[_-]?key|key|secret|password|passwd|authorization)\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;&]+)/gi,
+      /((?<![A-Za-z0-9])["']?authorization["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\r\n,;}]+)/gi,
+      "$1[redacted]",
+    )
+    .replace(
+      /((?<![A-Za-z0-9])["']?(?:access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|oauth[_-]?token|session[_-]?token|token|(?:x-)?api[_-]?key|key|secret|password|passwd)["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;&}"']+)/gi,
       "$1[redacted]",
     )
     .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "[redacted-email]")
@@ -2765,8 +2769,46 @@ export class ChatGptBrowserWorker {
     }
     await captureDiagnostic?.("effort-menu-open-requested");
     const effortItems = activation.menu.locator(CHATGPT_EFFORT_ITEM_SELECTOR).filter({ visible: true });
+    const effortSurfaceWaitAbort = new AbortController();
+    let effortSurface: "radio-item" | "slider" | "session-expired";
+    try {
+      effortSurface = await Promise.any([
+        effortItems.nth(0).waitFor({
+          state: "visible",
+          timeout: 5_000,
+          signal: effortSurfaceWaitAbort.signal,
+        }).then(() => "radio-item" as const),
+        activation.sliderContainer.waitFor({
+          state: "visible",
+          timeout: 5_000,
+          signal: effortSurfaceWaitAbort.signal,
+        }).then(() => "slider" as const),
+        chatGptExpiredSessionAlert(page).waitFor({
+          state: "visible",
+          timeout: 5_000,
+          signal: effortSurfaceWaitAbort.signal,
+        }).then(() => "session-expired" as const),
+      ]);
+    } catch {
+      await throwIfChatGptRateLimitDialog(page);
+      await throwIfChatGptSessionFailureAlert(page);
+      throw chatGptModelControlUnavailableAdapterError(
+        "ChatGPT effort menu exposed neither radio items nor a visible slider after 5 seconds",
+      );
+    } finally {
+      effortSurfaceWaitAbort.abort();
+    }
+    if (effortSurface === "session-expired") {
+      await throwIfChatGptSessionFailureAlert(page);
+      throw chatGptModelControlUnavailableAdapterError(
+        "ChatGPT session expired while waiting for effort controls",
+      );
+    }
+    await throwIfChatGptSessionFailureAlert(page);
     const effortItemCount = await effortItems.count();
-    if (effortItemCount > 0 && !await activation.sliderContainer.isVisible().catch(() => false)) {
+    const sliderVisible = effortSurface === "slider"
+      || await activation.sliderContainer.isVisible().catch(() => false);
+    if (effortItemCount > 0 && !sliderVisible) {
       if (effortItemCount <= uiEffortIndex) {
         throw chatGptModelControlUnavailableAdapterError(
           `ChatGPT effort menu exposes ${effortItemCount} radio items, not requested item index ${uiEffortIndex}`,
