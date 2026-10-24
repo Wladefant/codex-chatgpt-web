@@ -290,33 +290,56 @@ test("ChatGPT session endpoint distinguishes valid, guest, expired, malformed, a
     else delete (globalThis as typeof globalThis & { location?: Location }).location;
   }
 });
+test("ChatGPT challenge detection ignores a solved Turnstile widget", () => {
+  const baseline = {
+    title: "ChatGPT",
+    bodyText: "",
+    visibleChallengeElementCount: 0,
+  };
+  expect(hasChatGptSecurityChallengeSignal({
+    ...baseline,
+    visibleTurnstileWidgetCount: 1,
+    turnstileVerified: false,
+  })).toBe(true);
+  expect(hasChatGptSecurityChallengeSignal({
+    ...baseline,
+    visibleTurnstileWidgetCount: 1,
+    turnstileVerified: true,
+  })).toBe(false);
+});
+
 test("ChatGPT challenge detection requires a clear visible challenge signal", () => {
+  const noWidget = { visibleTurnstileWidgetCount: 0, turnstileVerified: false };
   expect(hasChatGptSecurityChallengeSignal({
     title: "Just a moment...",
     bodyText: "",
     visibleChallengeElementCount: 0,
+    ...noWidget,
   })).toBe(true);
   expect(hasChatGptSecurityChallengeSignal({
     title: "ChatGPT",
     bodyText: "Please verify you are human to continue.",
     visibleChallengeElementCount: 0,
+    ...noWidget,
   })).toBe(true);
   expect(hasChatGptSecurityChallengeSignal({
     title: "ChatGPT",
     bodyText: "",
     visibleChallengeElementCount: 1,
+    ...noWidget,
   })).toBe(true);
   expect(hasChatGptSecurityChallengeSignal({
     title: "ChatGPT",
     bodyText: "ChatGPT can help with security questions.",
     visibleChallengeElementCount: 0,
+    ...noWidget,
   })).toBe(false);
 });
 
 test("ChatGPT challenge wait stops when the passive signal clears", async () => {
   const signals = [
-    { title: "Just a moment...", bodyText: "", visibleChallengeElementCount: 0 },
-    { title: "ChatGPT", bodyText: "", visibleChallengeElementCount: 0 },
+    { title: "Just a moment...", bodyText: "", visibleChallengeElementCount: 0, visibleTurnstileWidgetCount: 0, turnstileVerified: false },
+    { title: "ChatGPT", bodyText: "", visibleChallengeElementCount: 0, visibleTurnstileWidgetCount: 0, turnstileVerified: false },
   ];
   let reads = 0;
   const page = { evaluate: async () => signals[Math.min(reads++, signals.length - 1)] };
@@ -331,7 +354,13 @@ test("ChatGPT challenge wait returns fail-closed when the challenge remains past
   const page = {
     evaluate: async () => {
       reads += 1;
-      return { title: "Checking your browser", bodyText: "", visibleChallengeElementCount: 0 };
+      return {
+        title: "Checking your browser",
+        bodyText: "",
+        visibleChallengeElementCount: 0,
+        visibleTurnstileWidgetCount: 0,
+        turnstileVerified: false,
+      };
     },
   };
 
