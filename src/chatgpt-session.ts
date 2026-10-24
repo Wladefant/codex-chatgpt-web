@@ -262,8 +262,11 @@ export function hasChatGptSecurityChallengeSignal(signals: {
   title: string;
   bodyText: string;
   visibleChallengeElementCount: number;
+  visibleTurnstileWidgetCount: number;
+  turnstileVerified: boolean;
 }): boolean {
-  if (signals.visibleChallengeElementCount > 0) return true;
+  if (signals.visibleChallengeElementCount > 0
+    || (signals.visibleTurnstileWidgetCount > 0 && !signals.turnstileVerified)) return true;
   return /checking your browser|just a moment|attention required|security verification|verify you are human/i.test(signals.title)
     || /checking your browser|complete (?:the )?(?:security|cloudflare) check|security verification|verify (?:that )?you are human|enable javascript and cookies to continue/i
       .test(signals.bodyText);
@@ -271,15 +274,7 @@ export function hasChatGptSecurityChallengeSignal(signals: {
 
 export async function detectChatGptSecurityChallenge(page: Page): Promise<boolean> {
   const signals = await page.evaluate(() => {
-    const selector = [
-      ".cf-turnstile",
-      "#cf-challenge-running",
-      "#challenge-form",
-      '[data-cf-challenge]',
-      'iframe[src*="challenges.cloudflare.com"]',
-      'input[name="cf-turnstile-response"]',
-    ].join(", ");
-    const visibleChallengeElementCount = [...document.querySelectorAll(selector)].filter(element => {
+    const visible = (element: Element): boolean => {
       const style = getComputedStyle(element);
       const bounds = element.getBoundingClientRect();
       return element.isConnected
@@ -288,11 +283,25 @@ export async function detectChatGptSecurityChallenge(page: Page): Promise<boolea
         && style.opacity !== "0"
         && bounds.width > 0
         && bounds.height > 0;
-    }).length;
+    };
+    const widgets = [...document.querySelectorAll(".cf-turnstile")];
+    const turnstileVerified = [...document.querySelectorAll(
+      'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]',
+    )].some(element => (
+      (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement)
+      && element.value.trim().length > 0
+    ));
+    const visibleChallengeElementCount = [
+      ...document.querySelectorAll("#cf-challenge-running, #challenge-running, #challenge-form, [data-cf-challenge]"),
+    ].filter(visible).length
+      + [...document.querySelectorAll('iframe[src*="challenges.cloudflare.com"]')]
+        .filter(frame => visible(frame) && (!frame.closest(".cf-turnstile") || !turnstileVerified)).length;
     return {
       title: document.title,
       bodyText: document.body?.innerText?.slice(0, 10_000) ?? "",
       visibleChallengeElementCount,
+      visibleTurnstileWidgetCount: widgets.filter(visible).length,
+      turnstileVerified,
     };
   });
   return hasChatGptSecurityChallengeSignal(signals);
