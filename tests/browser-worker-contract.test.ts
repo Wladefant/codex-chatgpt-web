@@ -2912,6 +2912,33 @@ test("a persistent Cloudflare challenge stops session preparation and captures a
     rmSync(diagnosticsRoot, { recursive: true, force: true });
   }
 });
+test("a failing challenge diagnostic does not mask the security challenge error", async () => {
+  const page = {
+    url: () => CHATGPT_TEMPORARY_CHAT_URL,
+    evaluate: async () => ({ title: "Just a moment...", bodyText: "", visibleChallengeElementCount: 1 }),
+  };
+  const worker = Object.assign(Object.create(ChatGptBrowserWorker.prototype), {
+    config: { appName: "Codex Native2" },
+  }) as {
+    prepareTemporaryChatSurface(
+      page: unknown,
+      captureDiagnostic: (checkpoint: string) => Promise<void>,
+      challengeWaitOptions?: { timeoutMs?: number; pollMs?: number },
+    ): Promise<unknown>;
+  };
+
+  await expect(worker.prepareTemporaryChatSurface(
+    page,
+    async () => { throw new Error("diagnostic write failed"); },
+    { timeoutMs: 0, pollMs: 1 },
+  )).rejects.toMatchObject({
+    name: "ChatGptWebAdapterError",
+    status: 403,
+    code: "chatgpt_security_challenge",
+    retryable: false,
+  });
+});
+
 
 test("effort selection stops as soon as ChatGPT reports an expired session", async () => {
   const neverVisible = new Promise<void>(() => {});
@@ -2974,7 +3001,7 @@ test("effort menu waiting stops when ChatGPT reports an expired session", async 
   const composerForm = { locator: () => effortControl };
   const composer = { locator: () => composerForm };
   const effortChoice = { waitFor: async () => await neverVisible };
-  const effortChoices = { nth: () => effortChoice, count: async () => 3 };
+  const effortChoices = { nth: () => effortChoice, count: async () => 3, filter() { return this; } };
   const effortMenu = {
     last() { return this; },
     isVisible: async () => true,
@@ -2984,6 +3011,7 @@ test("effort menu waiting stops when ChatGPT reports an expired session", async 
     filter() { return this; },
     last() { return this; },
     locator() { return this; },
+    isVisible: async () => true,
     waitFor: async () => await neverVisible,
   };
   const sessionAlert = {

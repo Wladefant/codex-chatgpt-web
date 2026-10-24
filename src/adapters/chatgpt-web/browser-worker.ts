@@ -1914,6 +1914,44 @@ export function redactChatGptUiDiagnostic(value: string): string {
     .replace(/\b(turn|binding|call)_[A-Za-z0-9_-]{12,}\b/g, "$1_[redacted]");
 }
 
+interface ChatGptDiagnosticCauseEntry {
+  name: string;
+  message: string;
+}
+
+interface ChatGptDiagnosticErrorRecord {
+  error: string;
+  cause?: ChatGptDiagnosticCauseEntry[];
+}
+
+const CHATGPT_DIAGNOSTIC_CAUSE_LIMIT = 4;
+const CHATGPT_DIAGNOSTIC_CAUSE_MESSAGE_LIMIT = 500;
+
+function serializeChatGptDiagnosticCause(value: unknown): ChatGptDiagnosticCauseEntry[] | undefined {
+  const causes: ChatGptDiagnosticCauseEntry[] = [];
+  const seen = new Set<Error>();
+  let current = value;
+  while (current instanceof Error && causes.length < CHATGPT_DIAGNOSTIC_CAUSE_LIMIT && !seen.has(current)) {
+    seen.add(current);
+    causes.push({
+      name: /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(current.name) ? current.name : "Error",
+      message: redactChatGptUiDiagnostic(current.message).slice(0, CHATGPT_DIAGNOSTIC_CAUSE_MESSAGE_LIMIT),
+    });
+    current = current.cause;
+  }
+  return causes.length > 0 ? causes : undefined;
+}
+
+export function serializeChatGptDiagnosticError(value: unknown): ChatGptDiagnosticErrorRecord | undefined {
+  if (value === undefined) return undefined;
+  const isError = value instanceof Error;
+  const cause = isError ? serializeChatGptDiagnosticCause(value.cause) : undefined;
+  return {
+    error: redactChatGptUiDiagnostic(isError ? value.message : String(value)),
+    ...(cause ? { cause } : {}),
+  };
+}
+
 const CHATGPT_DIAGNOSTIC_SAFE_STRING_KEYS = new Set([
   "tag",
   "role",
@@ -2172,14 +2210,13 @@ class ChatGptBrowserDiagnostics {
           ),
         ]] : []),
       ]);
+      const errorRecord = serializeChatGptDiagnosticError(error);
       atomicWriteFile(join(this.directory, `${stem}.json`), `${JSON.stringify({
         version: 2,
         capturedAt,
         traceId: this.traceId,
         checkpoint,
-        ...(error !== undefined ? {
-          error: redactChatGptUiDiagnostic(error instanceof Error ? error.message : String(error)),
-        } : {}),
+        ...(errorRecord ?? {}),
         ...(stateResult.status === "fulfilled"
           ? { state: sanitizeChatGptBrowserDiagnosticState(stateResult.value) }
           : {}),
@@ -2720,6 +2757,49 @@ export class ChatGptBrowserWorker {
       await captureDiagnostic?.("effort-menu-pointerdown-fallback");
     }
     await captureDiagnostic?.("effort-menu-open-requested");
+    const effortItems = activation.menu.locator(CHATGPT_EFFORT_ITEM_SELECTOR).filter({ visible: true });
+    const effortItemCount = await effortItems.count();
+    if (effortItemCount > 0 && !await activation.sliderContainer.isVisible().catch(() => false)) {
+      if (effortItemCount <= uiEffortIndex) {
+        throw chatGptModelControlUnavailableAdapterError(
+          `ChatGPT effort menu exposes ${effortItemCount} radio items, not requested item index ${uiEffortIndex}`,
+        );
+      }
+      const selectedItem = effortItems.nth(uiEffortIndex);
+      if (await selectedItem.getAttribute("aria-disabled") === "true") {
+        throw chatGptModelControlUnavailableAdapterError(
+          `ChatGPT effort menu radio item index ${uiEffortIndex} is disabled`,
+        );
+      }
+      await selectedItem.click({ force: true });
+      await settleChatGptUi();
+      if (await selectedItem.getAttribute("aria-checked") !== "true"
+        || (await currentEffort.getAttribute("data-selected-reasoning-effort"))?.trim().toLowerCase() !== mode.effort) {
+        throw chatGptModelControlUnavailableAdapterError(
+          `ChatGPT did not select requested effort radio item index ${uiEffortIndex}`,
+        );
+      }
+      await page.keyboard.press("Escape");
+      await settleChatGptUi();
+      const selectedMode: SelectedChatGptWebModelMode = {
+        ...mode,
+        selection: { url: page.url(), label: (await currentEffort.innerText()).trim() },
+      };
+      await this.assertSelectedEffort(page, selectedMode);
+      const confirmation = await activateChatGptEffortMenu(page, currentEffort);
+      const confirmedItems = confirmation.menu.locator(CHATGPT_EFFORT_ITEM_SELECTOR).filter({ visible: true });
+      if (await confirmedItems.count() <= uiEffortIndex
+        || await confirmedItems.nth(uiEffortIndex).getAttribute("aria-checked") !== "true") {
+        throw chatGptModelControlUnavailableAdapterError(
+          "ChatGPT did not retain the requested effort radio selection after closing its menu",
+        );
+      }
+      await page.keyboard.press("Escape");
+      await settleChatGptUi();
+      await this.assertSelectedEffort(page, selectedMode);
+      await captureDiagnostic?.("effort-selection-confirmed");
+      return selectedMode;
+    }
     const effortSlider = activation.slider;
     const sliderContainer = activation.sliderContainer;
     const waitAbort = new AbortController();
@@ -2900,15 +2980,22 @@ export class ChatGptBrowserWorker {
       await captureDiagnostic?.("temporary-chat-navigation-complete");
     }
     if (await waitForChatGptSecurityChallenge(page, challengeWaitOptions)) {
-      if (captureDiagnostic) {
-        await captureDiagnostic("security-challenge-remains");
-      } else {
-        const diagnostics = new ChatGptBrowserDiagnostics(
-          `challenge_${randomUUID().replaceAll("-", "")}`,
-          this.config.browserDiagnosticsPath ?? join(getConfigDir(), "diagnostics", "browser-turns"),
-          this.config.appName,
+      try {
+        if (captureDiagnostic) {
+          await captureDiagnostic("security-challenge-remains");
+        } else {
+          const diagnostics = new ChatGptBrowserDiagnostics(
+            `challenge_${randomUUID().replaceAll("-", "")}`,
+            this.config.browserDiagnosticsPath ?? join(getConfigDir(), "diagnostics", "browser-turns"),
+            this.config.appName,
+          );
+          await diagnostics.capture(page, "security-challenge-remains");
+        }
+      } catch (captureError) {
+        console.warn(
+          `[chatgpt-web] security challenge diagnostic capture failed:`
+          + ` ${captureError instanceof Error ? captureError.message : String(captureError)}`,
         );
-        await diagnostics.capture(page, "security-challenge-remains");
       }
       throw new ChatGptWebAdapterError(
         "ChatGPT still shows a Cloudflare or Turnstile security challenge after waiting. Complete verification in the same Codex Web GPT bridge profile, then run `codex-chatgpt-web login` again. This turn stopped without interacting with the challenge.",
