@@ -8,10 +8,17 @@ import {
   loginToChatGpt,
   loginVerificationMarkerPath,
   sanitizeBrowserLoginStorageState,
+  chatGptLoginTimeoutError,
 } from "../src/browser-login";
 import { CHATGPT_TEMPORARY_CHAT_URL } from "../src/chatgpt-session";
 import { defaultConfig } from "../src/config";
 
+test("a bounded login timeout gives a safe challenge recovery action on every platform", () => {
+  const error = chatGptLoginTimeoutError(60_000);
+  expect(error.message).toContain("Chrome login timed out after 60000ms");
+  expect(error.message).toContain("complete it in Chrome");
+  expect(error.message).toContain("codex-chatgpt-web login again");
+});
 test("login starts with normal Chrome and captures state in a headed Keychain-aware context", async () => {
   if (process.platform === "win32") return;
   const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-login-"));

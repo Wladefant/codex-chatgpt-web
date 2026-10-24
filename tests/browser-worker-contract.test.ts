@@ -2870,6 +2870,85 @@ test.each([
   });
 });
 
+test("a persistent Cloudflare challenge stops session preparation and captures a screenshot", async () => {
+  const diagnosticsRoot = mkdtempSync(join(tmpdir(), "cgw-security-challenge-"));
+  let screenshots = 0;
+  let reads = 0;
+  const page = {
+    url: () => CHATGPT_TEMPORARY_CHAT_URL,
+    evaluate: async () => {
+      reads += 1;
+      return { title: "Just a moment...", bodyText: "", visibleChallengeElementCount: 1 };
+    },
+    screenshot: async () => {
+      screenshots += 1;
+      return Buffer.from("challenge screenshot fixture");
+    },
+  };
+  const worker = Object.assign(Object.create(ChatGptBrowserWorker.prototype), {
+    config: { browserDiagnosticsPath: diagnosticsRoot, appName: "Codex Native2" },
+  }) as {
+    prepareTemporaryChatSurface(
+      page: unknown,
+      captureDiagnostic?: (checkpoint: string) => Promise<void>,
+      challengeWaitOptions?: { timeoutMs?: number; pollMs?: number },
+    ): Promise<unknown>;
+  };
+
+  try {
+    await expect(worker.prepareTemporaryChatSurface(page, undefined, { timeoutMs: 0, pollMs: 1 }))
+      .rejects.toMatchObject({
+        name: "ChatGptWebAdapterError",
+        status: 403,
+        code: "chatgpt_security_challenge",
+        retryable: false,
+      });
+    expect(reads).toBe(2);
+    expect(screenshots).toBe(1);
+    const traceDirectory = readdirSync(diagnosticsRoot)[0]!;
+    const files = readdirSync(join(diagnosticsRoot, traceDirectory));
+    expect(files.some(file => file.includes("security-challenge-remains") && file.endsWith(".png"))).toBe(true);
+  } finally {
+    rmSync(diagnosticsRoot, { recursive: true, force: true });
+  }
+});
+test("a failing challenge diagnostic does not mask the security challenge error", async () => {
+  const page = {
+    url: () => CHATGPT_TEMPORARY_CHAT_URL,
+    evaluate: async () => ({ title: "Just a moment...", bodyText: "", visibleChallengeElementCount: 1 }),
+  };
+  const worker = Object.assign(Object.create(ChatGptBrowserWorker.prototype), {
+    config: { appName: "Codex Native2" },
+  }) as {
+    prepareTemporaryChatSurface(
+      page: unknown,
+      captureDiagnostic: (checkpoint: string) => Promise<void>,
+      challengeWaitOptions?: { timeoutMs?: number; pollMs?: number },
+    ): Promise<unknown>;
+  };
+
+  const originalWarn = console.warn;
+  const warnings: string[] = [];
+  console.warn = (...values) => { warnings.push(values.map(String).join(" ")); };
+  try {
+    await expect(worker.prepareTemporaryChatSurface(
+      page,
+      async () => { throw new Error("diagnostic write failed"); },
+      { timeoutMs: 0, pollMs: 1 },
+    )).rejects.toMatchObject({
+      name: "ChatGptWebAdapterError",
+      status: 403,
+      code: "chatgpt_security_challenge",
+      retryable: false,
+    });
+  } finally {
+    console.warn = originalWarn;
+  }
+  expect(warnings.join(" ")).toContain("security challenge diagnostic capture failed");
+  expect(warnings.join(" ")).not.toContain("diagnostic write failed");
+});
+
+
 test("effort selection stops as soon as ChatGPT reports an expired session", async () => {
   const neverVisible = new Promise<void>(() => {});
   const effortControl = {
@@ -2931,7 +3010,7 @@ test("effort menu waiting stops when ChatGPT reports an expired session", async 
   const composerForm = { locator: () => effortControl };
   const composer = { locator: () => composerForm };
   const effortChoice = { waitFor: async () => await neverVisible };
-  const effortChoices = { nth: () => effortChoice, count: async () => 3 };
+  const effortChoices = { nth: () => effortChoice, count: async () => 3, filter() { return this; } };
   const effortMenu = {
     last() { return this; },
     isVisible: async () => true,
@@ -2941,6 +3020,7 @@ test("effort menu waiting stops when ChatGPT reports an expired session", async 
     filter() { return this; },
     last() { return this; },
     locator() { return this; },
+    isVisible: async () => true,
     waitFor: async () => await neverVisible,
   };
   const sessionAlert = {

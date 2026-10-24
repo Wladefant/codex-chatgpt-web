@@ -208,11 +208,7 @@ async function anyVisible(locator: Locator): Promise<boolean> {
   return false;
 }
 
-export async function assertAuthenticatedChatGptPage(page: Page): Promise<void> {
-  const composer = page.locator(CHATGPT_COMPOSER_SELECTOR);
-  if (!await anyVisible(composer)) {
-    throw new Error("ChatGPT authentication could not be verified: no visible composer is present");
-  }
+export async function assertValidChatGptSession(page: Page): Promise<void> {
   const sessionAuthenticated = await page.evaluate(async () => {
     const pageUrl = new URL(location.href);
     if (pageUrl.origin !== "https://chatgpt.com") return false;
@@ -249,6 +245,85 @@ export async function assertAuthenticatedChatGptPage(page: Page): Promise<void> 
   if (!sessionAuthenticated) {
     throw new Error("ChatGPT authentication could not be verified: no valid signed-in session is present");
   }
+}
+
+export async function assertAuthenticatedChatGptPage(page: Page): Promise<void> {
+  await assertValidChatGptSession(page);
+  const composer = page.locator(CHATGPT_COMPOSER_SELECTOR);
+  if (!await anyVisible(composer)) {
+    throw new Error("ChatGPT authentication could not be verified: no visible composer is present");
+  }
+}
+
+export const CHATGPT_SECURITY_CHALLENGE_WAIT_MS = 60_000;
+export const CHATGPT_SECURITY_CHALLENGE_POLL_MS = 1_000;
+
+export function hasChatGptSecurityChallengeSignal(signals: {
+  title: string;
+  bodyText: string;
+  visibleChallengeElementCount: number;
+  visibleTurnstileWidgetCount: number;
+  turnstileVerified: boolean;
+}): boolean {
+  if (signals.visibleChallengeElementCount > 0
+    || (signals.visibleTurnstileWidgetCount > 0 && !signals.turnstileVerified)) return true;
+  return /checking your browser|just a moment|attention required|security verification|verify you are human/i.test(signals.title)
+    || /checking your browser|complete (?:the )?(?:security|cloudflare) check|security verification|verify (?:that )?you are human|enable javascript and cookies to continue/i
+      .test(signals.bodyText);
+}
+
+export async function detectChatGptSecurityChallenge(page: Page): Promise<boolean> {
+  const signals = await page.evaluate(() => {
+    const visible = (element: Element): boolean => {
+      const style = getComputedStyle(element);
+      const bounds = element.getBoundingClientRect();
+      return element.isConnected
+        && style.display !== "none"
+        && style.visibility !== "hidden"
+        && style.opacity !== "0"
+        && bounds.width > 0
+        && bounds.height > 0;
+    };
+    const widgets = [...document.querySelectorAll(".cf-turnstile")];
+    const turnstileVerified = [...document.querySelectorAll(
+      'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]',
+    )].some(element => (
+      (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement)
+      && element.value.trim().length > 0
+    ));
+    const visibleChallengeElementCount = [
+      ...document.querySelectorAll("#cf-challenge-running, #challenge-running, #challenge-form, [data-cf-challenge]"),
+    ].filter(visible).length
+      + [...document.querySelectorAll('iframe[src*="challenges.cloudflare.com"]')]
+        .filter(frame => visible(frame) && (!frame.closest(".cf-turnstile") || !turnstileVerified)).length;
+    return {
+      title: document.title,
+      bodyText: document.body?.innerText?.slice(0, 10_000) ?? "",
+      visibleChallengeElementCount,
+      visibleTurnstileWidgetCount: widgets.filter(visible).length,
+      turnstileVerified,
+    };
+  });
+  return hasChatGptSecurityChallengeSignal(signals);
+}
+export async function waitForChatGptSecurityChallenge(
+  page: Page,
+  options: { timeoutMs?: number; pollMs?: number } = {},
+): Promise<boolean> {
+  const timeoutMs = options.timeoutMs ?? CHATGPT_SECURITY_CHALLENGE_WAIT_MS;
+  const pollMs = options.pollMs ?? CHATGPT_SECURITY_CHALLENGE_POLL_MS;
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 0 || !Number.isFinite(pollMs) || pollMs < 1) {
+    throw new Error("ChatGPT security challenge wait requires a finite non-negative timeout and positive poll interval");
+  }
+  const deadline = Date.now() + timeoutMs;
+  let challengeVisible = await detectChatGptSecurityChallenge(page);
+  while (challengeVisible && Date.now() < deadline) {
+    const { promise, resolve } = Promise.withResolvers<void>();
+    setTimeout(resolve, Math.min(pollMs, deadline - Date.now()));
+    await promise;
+    challengeVisible = await detectChatGptSecurityChallenge(page);
+  }
+  return challengeVisible;
 }
 
 export async function assertTemporaryChatPage(page: Page): Promise<void> {

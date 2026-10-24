@@ -48,6 +48,8 @@ import {
 } from "./prompt";
 import { estimateCompiledChatGptWebInputTokens } from "./input-tokens";
 import {
+  assertValidChatGptSession,
+  waitForChatGptSecurityChallenge,
   assertAuthenticatedChatGptPage,
   assertTemporaryChatPage,
   CHATGPT_ASSISTANT_TURN_SELECTOR,
@@ -1908,8 +1910,57 @@ export function stripChatGptTraceControlSuffix(block: ChatGptVisibleTraceBlock):
 
 export function redactChatGptUiDiagnostic(value: string): string {
   return value
+    .replace(/\b(?:https?|wss?|ftp):\/\/[^\s"'<>]+/gi, "[redacted-url]")
+    .replace(/\bBearer\s+[^\s,;]+/gi, "Bearer [redacted]")
+    .replace(
+      /((?<![A-Za-z0-9])["']?authorization["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|"(?:\\.|[^\r\n])*|'(?:\\.|[^\r\n])*|[^\r\n,;}]+)/gi,
+      "$1[redacted]",
+    )
+    .replace(
+      /((?<![A-Za-z0-9])["']?(?:access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|oauth[_-]?token|session[_-]?token|token|(?:x-)?api[_-]?key|key|secret|password|passwd)["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|"(?:\\.|[^\r\n])*|'(?:\\.|[^\r\n])*|[^\s,;&}"']+)/gi,
+      "$1[redacted]",
+    )
+    .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "[redacted-email]")
     .replace(/<codex_context_json>[\s\S]*?<\/codex_context_json>/gi, "<codex_context_json>[redacted]</codex_context_json>")
     .replace(/\b(turn|binding|call)_[A-Za-z0-9_-]{12,}\b/g, "$1_[redacted]");
+}
+
+interface ChatGptDiagnosticCauseEntry {
+  name: string;
+  message: string;
+}
+
+interface ChatGptDiagnosticErrorRecord {
+  error: string;
+  cause?: ChatGptDiagnosticCauseEntry[];
+}
+
+const CHATGPT_DIAGNOSTIC_CAUSE_LIMIT = 4;
+const CHATGPT_DIAGNOSTIC_MESSAGE_LIMIT = 500;
+
+function serializeChatGptDiagnosticCause(value: unknown): ChatGptDiagnosticCauseEntry[] | undefined {
+  const causes: ChatGptDiagnosticCauseEntry[] = [];
+  const seen = new Set<Error>();
+  let current = value;
+  while (current instanceof Error && causes.length < CHATGPT_DIAGNOSTIC_CAUSE_LIMIT && !seen.has(current)) {
+    seen.add(current);
+    causes.push({
+      name: /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(current.name) ? current.name : "Error",
+      message: redactChatGptUiDiagnostic(current.message).slice(0, CHATGPT_DIAGNOSTIC_MESSAGE_LIMIT),
+    });
+    current = current.cause;
+  }
+  return causes.length > 0 ? causes : undefined;
+}
+
+export function serializeChatGptDiagnosticError(value: unknown): ChatGptDiagnosticErrorRecord | undefined {
+  if (value === undefined) return undefined;
+  const isError = value instanceof Error;
+  const cause = isError ? serializeChatGptDiagnosticCause(value.cause) : undefined;
+  return {
+    error: redactChatGptUiDiagnostic(isError ? value.message : String(value)).slice(0, CHATGPT_DIAGNOSTIC_MESSAGE_LIMIT),
+    ...(cause ? { cause } : {}),
+  };
 }
 
 const CHATGPT_DIAGNOSTIC_SAFE_STRING_KEYS = new Set([
@@ -1997,7 +2048,8 @@ class ChatGptBrowserDiagnostics {
       }
       const sequence = String(++this.sequence).padStart(2, "0");
       const stem = `${sequence}-${browserDiagnosticCheckpoint(checkpoint)}`;
-      const includeScreenshot = process.env.CODEX_CHATGPT_WEB_BROWSER_DIAGNOSTICS === "1";
+      const includeScreenshot = process.env.CODEX_CHATGPT_WEB_BROWSER_DIAGNOSTICS === "1"
+        || checkpoint === "security-challenge-remains";
       const [screenshotResult, stateResult] = await Promise.allSettled([
         includeScreenshot
           ? page.screenshot({ animations: "disabled", caret: "hide", timeout: 5_000, type: "png" })
@@ -2169,14 +2221,13 @@ class ChatGptBrowserDiagnostics {
           ),
         ]] : []),
       ]);
+      const errorRecord = serializeChatGptDiagnosticError(error);
       atomicWriteFile(join(this.directory, `${stem}.json`), `${JSON.stringify({
         version: 2,
         capturedAt,
         traceId: this.traceId,
         checkpoint,
-        ...(error !== undefined ? {
-          error: redactChatGptUiDiagnostic(error instanceof Error ? error.message : String(error)),
-        } : {}),
+        ...(errorRecord ?? {}),
         ...(stateResult.status === "fulfilled"
           ? { state: sanitizeChatGptBrowserDiagnosticState(stateResult.value) }
           : {}),
@@ -2695,6 +2746,7 @@ export class ChatGptBrowserWorker {
     } catch (error) {
       if (error instanceof ChatGptWebAdapterError) throw error;
       await throwIfChatGptSessionFailureAlert(page);
+      await assertValidChatGptSession(page);
       throw chatGptModelControlUnavailableError(
         "ChatGPT rendered the composer but its model/effort control did not become ready",
       );
@@ -2716,6 +2768,88 @@ export class ChatGptBrowserWorker {
       await captureDiagnostic?.("effort-menu-pointerdown-fallback");
     }
     await captureDiagnostic?.("effort-menu-open-requested");
+    const effortItems = activation.menu.locator(CHATGPT_EFFORT_ITEM_SELECTOR).filter({ visible: true });
+    const effortSurfaceWaitTimeoutMs = 70_000;
+    const effortSurfaceWaitAbort = new AbortController();
+    let effortSurface: "radio-item" | "slider" | "session-expired";
+    try {
+      effortSurface = await Promise.any([
+        effortItems.nth(0).waitFor({
+          state: "visible",
+          timeout: effortSurfaceWaitTimeoutMs,
+          signal: effortSurfaceWaitAbort.signal,
+        }).then(() => "radio-item" as const),
+        activation.sliderContainer.waitFor({
+          state: "visible",
+          timeout: effortSurfaceWaitTimeoutMs,
+          signal: effortSurfaceWaitAbort.signal,
+        }).then(() => "slider" as const),
+        chatGptExpiredSessionAlert(page).waitFor({
+          state: "visible",
+          timeout: effortSurfaceWaitTimeoutMs,
+          signal: effortSurfaceWaitAbort.signal,
+        }).then(() => "session-expired" as const),
+      ]);
+    } catch {
+      await throwIfChatGptRateLimitDialog(page);
+      await throwIfChatGptSessionFailureAlert(page);
+      throw chatGptModelControlUnavailableAdapterError(
+        `ChatGPT effort menu exposed neither radio items nor a visible slider after ${effortSurfaceWaitTimeoutMs / 1_000} seconds`,
+      );
+    } finally {
+      effortSurfaceWaitAbort.abort();
+    }
+    if (effortSurface === "session-expired") {
+      await throwIfChatGptSessionFailureAlert(page);
+      throw chatGptModelControlUnavailableAdapterError(
+        "ChatGPT session expired while waiting for effort controls",
+      );
+    }
+    await throwIfChatGptSessionFailureAlert(page);
+    const effortItemCount = await effortItems.count();
+    const sliderVisible = effortSurface === "slider"
+      || await activation.sliderContainer.isVisible().catch(() => false);
+    if (effortItemCount > 0 && !sliderVisible) {
+      if (effortItemCount <= uiEffortIndex) {
+        throw chatGptModelControlUnavailableAdapterError(
+          `ChatGPT effort menu exposes ${effortItemCount} radio items, not requested item index ${uiEffortIndex}`,
+        );
+      }
+      const selectedItem = effortItems.nth(uiEffortIndex);
+      if (await selectedItem.getAttribute("aria-disabled") === "true") {
+        throw chatGptModelControlUnavailableAdapterError(
+          `ChatGPT effort menu radio item index ${uiEffortIndex} is disabled`,
+        );
+      }
+      await selectedItem.click({ force: true });
+      await settleChatGptUi();
+      if (await selectedItem.getAttribute("aria-checked") !== "true"
+        || (await currentEffort.getAttribute("data-selected-reasoning-effort"))?.trim().toLowerCase() !== mode.effort) {
+        throw chatGptModelControlUnavailableAdapterError(
+          `ChatGPT did not select requested effort radio item index ${uiEffortIndex}`,
+        );
+      }
+      await page.keyboard.press("Escape");
+      await settleChatGptUi();
+      const selectedMode: SelectedChatGptWebModelMode = {
+        ...mode,
+        selection: { url: page.url(), label: (await currentEffort.innerText()).trim() },
+      };
+      await this.assertSelectedEffort(page, selectedMode);
+      const confirmation = await activateChatGptEffortMenu(page, currentEffort);
+      const confirmedItems = confirmation.menu.locator(CHATGPT_EFFORT_ITEM_SELECTOR).filter({ visible: true });
+      if (await confirmedItems.count() <= uiEffortIndex
+        || await confirmedItems.nth(uiEffortIndex).getAttribute("aria-checked") !== "true") {
+        throw chatGptModelControlUnavailableAdapterError(
+          "ChatGPT did not retain the requested effort radio selection after closing its menu",
+        );
+      }
+      await page.keyboard.press("Escape");
+      await settleChatGptUi();
+      await this.assertSelectedEffort(page, selectedMode);
+      await captureDiagnostic?.("effort-selection-confirmed");
+      return selectedMode;
+    }
     const effortSlider = activation.slider;
     const sliderContainer = activation.sliderContainer;
     const waitAbort = new AbortController();
@@ -2882,6 +3016,7 @@ export class ChatGptBrowserWorker {
   private async prepareTemporaryChatSurface(
     page: Page,
     captureDiagnostic?: (checkpoint: string) => Promise<void>,
+    challengeWaitOptions?: { timeoutMs?: number; pollMs?: number },
   ): Promise<Locator> {
     // Launcher verification refreshes its owned page before attaching Playwright so a newly added
     // connector is present in the catalog. Navigating again here destroys that freshly hydrated
@@ -2894,18 +3029,33 @@ export class ChatGptBrowserWorker {
       });
       await captureDiagnostic?.("temporary-chat-navigation-complete");
     }
-    let composer: Locator;
-    try {
-      composer = await this.activeComposer(page);
-    } catch {
-      throw new Error("ChatGPT web login is expired or the Temporary Chat surface is unavailable");
+    if (await waitForChatGptSecurityChallenge(page, challengeWaitOptions)) {
+      try {
+        if (captureDiagnostic) {
+          await captureDiagnostic("security-challenge-remains");
+        } else {
+          const diagnostics = new ChatGptBrowserDiagnostics(
+            `challenge_${randomUUID().replaceAll("-", "")}`,
+            this.config.browserDiagnosticsPath ?? join(getConfigDir(), "diagnostics", "browser-turns"),
+            this.config.appName,
+          );
+          await diagnostics.capture(page, "security-challenge-remains");
+        }
+      } catch {
+        console.warn("[chatgpt-web] security challenge diagnostic capture failed");
+      }
+      throw new ChatGptWebAdapterError(
+        "ChatGPT still shows a Cloudflare or Turnstile security challenge after waiting. Complete verification in the same Codex Web GPT bridge profile, then run `codex-chatgpt-web login` again. This turn stopped without interacting with the challenge.",
+        { status: 403, errorType: "authentication_error", code: "chatgpt_security_challenge", retryable: false },
+      );
     }
+    await throwIfChatGptSessionFailureAlert(page);
+    await assertValidChatGptSession(page);
+    const composer = await this.activeComposer(page);
     if (await dismissChatGptTemporaryChatOnboarding(page)) {
       await captureDiagnostic?.("temporary-chat-onboarding-dismissed");
     }
     await captureDiagnostic?.("composer-ready");
-    await throwIfChatGptSessionFailureAlert(page);
-    await assertAuthenticatedChatGptPage(page);
     await assertTemporaryChatPage(page);
     await captureDiagnostic?.("session-verified");
     return composer;

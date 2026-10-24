@@ -4,6 +4,7 @@ import {
   CHATGPT_ASSISTANT_TURN_SELECTOR,
   CHATGPT_COMPOSER_SELECTOR,
   CHATGPT_EFFORT_CONTROL_SELECTOR,
+  CHATGPT_EFFORT_ITEM_SELECTOR,
   CHATGPT_EFFORT_MENU_SELECTOR,
   CHATGPT_EFFORT_SLIDER_CONTAINER_SELECTOR,
   CHATGPT_SEND_BUTTON_SELECTOR,
@@ -13,6 +14,8 @@ import {
   chatGptTurnLocatorSelector,
   detectChatGptAccountCapabilities,
   assertAuthenticatedChatGptPage,
+  hasChatGptSecurityChallengeSignal,
+  waitForChatGptSecurityChallenge,
 } from "../src/chatgpt-session";
 
 test("composer and effort selectors exclude unrelated editable fields and menu buttons", () => {
@@ -237,6 +240,21 @@ test("ChatGPT session endpoint distinguishes valid, guest, expired, malformed, a
       user: { id: "fixture" },
       expires: "2099-01-01T00:00:00Z",
     });
+    const visibleComposerCount = composer.count;
+    composer.count = async () => 0;
+    sessionResponse.json = async () => ({
+      user: { id: "fixture" },
+      error: "unauthenticated",
+    });
+    await expect(assertAuthenticatedChatGptPage(page as never))
+      .rejects.toThrow("no valid signed-in session is present");
+    sessionResponse.json = async () => ({
+      user: { id: "fixture" },
+      expires: "2099-01-01T00:00:00Z",
+    });
+    await expect(assertAuthenticatedChatGptPage(page as never))
+      .rejects.toThrow("no visible composer is present");
+    composer.count = visibleComposerCount;
     await expect(assertAuthenticatedChatGptPage(page as never)).resolves.toBeUndefined();
 
     sessionResponse.json = async () => ({
@@ -272,6 +290,84 @@ test("ChatGPT session endpoint distinguishes valid, guest, expired, malformed, a
     if (previousLocation) Object.defineProperty(globalThis, "location", previousLocation);
     else delete (globalThis as typeof globalThis & { location?: Location }).location;
   }
+});
+test("ChatGPT challenge detection ignores a solved Turnstile widget", () => {
+  const baseline = {
+    title: "ChatGPT",
+    bodyText: "",
+    visibleChallengeElementCount: 0,
+  };
+  expect(hasChatGptSecurityChallengeSignal({
+    ...baseline,
+    visibleTurnstileWidgetCount: 1,
+    turnstileVerified: false,
+  })).toBe(true);
+  expect(hasChatGptSecurityChallengeSignal({
+    ...baseline,
+    visibleTurnstileWidgetCount: 1,
+    turnstileVerified: true,
+  })).toBe(false);
+});
+
+test("ChatGPT challenge detection requires a clear visible challenge signal", () => {
+  const noWidget = { visibleTurnstileWidgetCount: 0, turnstileVerified: false };
+  expect(hasChatGptSecurityChallengeSignal({
+    title: "Just a moment...",
+    bodyText: "",
+    visibleChallengeElementCount: 0,
+    ...noWidget,
+  })).toBe(true);
+  expect(hasChatGptSecurityChallengeSignal({
+    title: "ChatGPT",
+    bodyText: "Please verify you are human to continue.",
+    visibleChallengeElementCount: 0,
+    ...noWidget,
+  })).toBe(true);
+  expect(hasChatGptSecurityChallengeSignal({
+    title: "ChatGPT",
+    bodyText: "",
+    visibleChallengeElementCount: 1,
+    ...noWidget,
+  })).toBe(true);
+  expect(hasChatGptSecurityChallengeSignal({
+    title: "ChatGPT",
+    bodyText: "ChatGPT can help with security questions.",
+    visibleChallengeElementCount: 0,
+    ...noWidget,
+  })).toBe(false);
+});
+
+test("ChatGPT challenge wait stops when the passive signal clears", async () => {
+  const signals = [
+    { title: "Just a moment...", bodyText: "", visibleChallengeElementCount: 0, visibleTurnstileWidgetCount: 0, turnstileVerified: false },
+    { title: "ChatGPT", bodyText: "", visibleChallengeElementCount: 0, visibleTurnstileWidgetCount: 0, turnstileVerified: false },
+  ];
+  let reads = 0;
+  const page = { evaluate: async () => signals[Math.min(reads++, signals.length - 1)] };
+
+  await expect(waitForChatGptSecurityChallenge(page as never, { timeoutMs: 100, pollMs: 1 }))
+    .resolves.toBe(false);
+  expect(reads).toBe(2);
+});
+
+test("ChatGPT challenge wait returns fail-closed when the challenge remains past its deadline", async () => {
+  let reads = 0;
+  const page = {
+    evaluate: async () => {
+      reads += 1;
+      return {
+        title: "Checking your browser",
+        bodyText: "",
+        visibleChallengeElementCount: 0,
+        visibleTurnstileWidgetCount: 0,
+        turnstileVerified: false,
+      };
+    },
+  };
+
+  await expect(waitForChatGptSecurityChallenge(page as never, { timeoutMs: 5, pollMs: 1 }))
+    .resolves.toBe(true);
+  expect(reads).toBeGreaterThan(1);
 });
 test("a complete authenticated composer with no effort selector is Luna-only", async () => {
   const effortButton = {
@@ -373,7 +469,8 @@ function reasoningPicker(options: { max?: string; delay?: number; missing?: bool
   };
   const composer = { filter() { return this; }, last() { return this; }, isEditable: async () => true, locator: () => ({ locator: () => control }) };
   const modelRows = { count: async () => 3, first() { return this; }, waitFor: async () => {}, nth: () => { throw new Error("Model rows are not effort choices"); } };
-  const menu = { filter() { return this; }, last() { return this; }, isVisible: async () => true, locator: () => modelRows };
+  const effortItems = { filter() { return this; }, count: async () => 0 };
+  const menu = { filter() { return this; }, last() { return this; }, isVisible: async () => true, locator: (selector: string) => selector === CHATGPT_EFFORT_ITEM_SELECTOR ? effortItems : modelRows };
   const page = {
     url: () => "https://chatgpt.com/?temporary-chat=true",
     locator: (selector: string) => {
