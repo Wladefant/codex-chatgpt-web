@@ -48,6 +48,7 @@ import {
 } from "./prompt";
 import { estimateCompiledChatGptWebInputTokens } from "./input-tokens";
 import {
+  assertValidChatGptSession,
   assertAuthenticatedChatGptPage,
   assertTemporaryChatPage,
   CHATGPT_ASSISTANT_TURN_SELECTOR,
@@ -2695,6 +2696,7 @@ export class ChatGptBrowserWorker {
     } catch (error) {
       if (error instanceof ChatGptWebAdapterError) throw error;
       await throwIfChatGptSessionFailureAlert(page);
+      await assertValidChatGptSession(page);
       throw chatGptModelControlUnavailableError(
         "ChatGPT rendered the composer but its model/effort control did not become ready",
       );
@@ -2894,18 +2896,18 @@ export class ChatGptBrowserWorker {
       });
       await captureDiagnostic?.("temporary-chat-navigation-complete");
     }
+    await throwIfChatGptSessionFailureAlert(page);
+    await assertValidChatGptSession(page);
     let composer: Locator;
     try {
       composer = await this.activeComposer(page);
     } catch {
-      throw new Error("ChatGPT web login is expired or the Temporary Chat surface is unavailable");
+      throw new Error("ChatGPT's Temporary Chat surface is unavailable although the session is signed in");
     }
     if (await dismissChatGptTemporaryChatOnboarding(page)) {
       await captureDiagnostic?.("temporary-chat-onboarding-dismissed");
     }
     await captureDiagnostic?.("composer-ready");
-    await throwIfChatGptSessionFailureAlert(page);
-    await assertAuthenticatedChatGptPage(page);
     await assertTemporaryChatPage(page);
     await captureDiagnostic?.("session-verified");
     return composer;

@@ -208,11 +208,7 @@ async function anyVisible(locator: Locator): Promise<boolean> {
   return false;
 }
 
-export async function assertAuthenticatedChatGptPage(page: Page): Promise<void> {
-  const composer = page.locator(CHATGPT_COMPOSER_SELECTOR);
-  if (!await anyVisible(composer)) {
-    throw new Error("ChatGPT authentication could not be verified: no visible composer is present");
-  }
+export async function assertValidChatGptSession(page: Page): Promise<void> {
   const sessionAuthenticated = await page.evaluate(async () => {
     const pageUrl = new URL(location.href);
     if (pageUrl.origin !== "https://chatgpt.com") return false;
@@ -248,6 +244,14 @@ export async function assertAuthenticatedChatGptPage(page: Page): Promise<void> 
   });
   if (!sessionAuthenticated) {
     throw new Error("ChatGPT authentication could not be verified: no valid signed-in session is present");
+  }
+}
+
+export async function assertAuthenticatedChatGptPage(page: Page): Promise<void> {
+  await assertValidChatGptSession(page);
+  const composer = page.locator(CHATGPT_COMPOSER_SELECTOR);
+  if (!await anyVisible(composer)) {
+    throw new Error("ChatGPT authentication could not be verified: no visible composer is present");
   }
 }
 

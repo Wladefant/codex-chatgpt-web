@@ -435,7 +435,8 @@ export async function loginToChatGpt(
   mkdirSync(profileDir, { recursive: true, mode: 0o700 });
 
   process.stdout.write(
-    "A normal Chrome window is open. Sign in to ChatGPT (or confirm you are already signed in and see the composer), then quit this dedicated Chrome instance completely.\n",
+    "A normal Chrome window is open. Sign in to ChatGPT (or confirm you are already signed in and see the composer), then quit this dedicated Chrome instance completely. "
+    + "If ChatGPT shows a security check, complete it in Chrome; do not bypass it. Wait 60 seconds after a temporary login error, or up to an hour if ChatGPT reports suspicious activity, then run codex-chatgpt-web login again if needed.\n",
   );
   const loginBrowser = spawnBrowserProcess(config.chromeExecutablePath, [
     `--user-data-dir=${profileDir}`,
@@ -459,7 +460,9 @@ export async function loginToChatGpt(
     await stopBrowserProcess(loginBrowser);
     throw new Error("Login timeout must be positive and finite");
   }
-  const timer = setTimeout(() => rejectExit(new Error(`Chrome login timed out after ${timeoutMs}ms`)), timeoutMs);
+  const timer = setTimeout(() => rejectExit(new Error(
+    `Chrome login timed out after ${timeoutMs}ms. If ChatGPT shows a security check, complete it in Chrome and run codex-chatgpt-web login again.`,
+  )), timeoutMs);
   let loginExit: number;
   try {
     loginExit = await exitPromise;

@@ -13,6 +13,7 @@ import {
   chatGptTurnLocatorSelector,
   detectChatGptAccountCapabilities,
   assertAuthenticatedChatGptPage,
+  assertValidChatGptSession,
 } from "../src/chatgpt-session";
 
 test("composer and effort selectors exclude unrelated editable fields and menu buttons", () => {
@@ -237,6 +238,13 @@ test("ChatGPT session endpoint distinguishes valid, guest, expired, malformed, a
       user: { id: "fixture" },
       expires: "2099-01-01T00:00:00Z",
     });
+    const visibleComposerCount = composer.count;
+    composer.count = async () => 0;
+    await expect(assertValidChatGptSession(page as never)).resolves.toBeUndefined();
+    await expect(assertAuthenticatedChatGptPage(page as never))
+      .rejects.toThrow("no visible composer is present");
+    composer.count = visibleComposerCount;
+
     await expect(assertAuthenticatedChatGptPage(page as never)).resolves.toBeUndefined();
 
     sessionResponse.json = async () => ({
