@@ -13,6 +13,8 @@ import {
   chatGptTurnLocatorSelector,
   detectChatGptAccountCapabilities,
   assertAuthenticatedChatGptPage,
+  hasChatGptSecurityChallengeSignal,
+  waitForChatGptSecurityChallenge,
 } from "../src/chatgpt-session";
 
 test("composer and effort selectors exclude unrelated editable fields and menu buttons", () => {
@@ -287,6 +289,55 @@ test("ChatGPT session endpoint distinguishes valid, guest, expired, malformed, a
     if (previousLocation) Object.defineProperty(globalThis, "location", previousLocation);
     else delete (globalThis as typeof globalThis & { location?: Location }).location;
   }
+});
+test("ChatGPT challenge detection requires a clear visible challenge signal", () => {
+  expect(hasChatGptSecurityChallengeSignal({
+    title: "Just a moment...",
+    bodyText: "",
+    visibleChallengeElementCount: 0,
+  })).toBe(true);
+  expect(hasChatGptSecurityChallengeSignal({
+    title: "ChatGPT",
+    bodyText: "Please verify you are human to continue.",
+    visibleChallengeElementCount: 0,
+  })).toBe(true);
+  expect(hasChatGptSecurityChallengeSignal({
+    title: "ChatGPT",
+    bodyText: "",
+    visibleChallengeElementCount: 1,
+  })).toBe(true);
+  expect(hasChatGptSecurityChallengeSignal({
+    title: "ChatGPT",
+    bodyText: "ChatGPT can help with security questions.",
+    visibleChallengeElementCount: 0,
+  })).toBe(false);
+});
+
+test("ChatGPT challenge wait stops when the passive signal clears", async () => {
+  const signals = [
+    { title: "Just a moment...", bodyText: "", visibleChallengeElementCount: 0 },
+    { title: "ChatGPT", bodyText: "", visibleChallengeElementCount: 0 },
+  ];
+  let reads = 0;
+  const page = { evaluate: async () => signals[Math.min(reads++, signals.length - 1)] };
+
+  await expect(waitForChatGptSecurityChallenge(page as never, { timeoutMs: 100, pollMs: 1 }))
+    .resolves.toBe(false);
+  expect(reads).toBe(2);
+});
+
+test("ChatGPT challenge wait returns fail-closed when the challenge remains past its deadline", async () => {
+  let reads = 0;
+  const page = {
+    evaluate: async () => {
+      reads += 1;
+      return { title: "Checking your browser", bodyText: "", visibleChallengeElementCount: 0 };
+    },
+  };
+
+  await expect(waitForChatGptSecurityChallenge(page as never, { timeoutMs: 5, pollMs: 1 }))
+    .resolves.toBe(true);
+  expect(reads).toBeGreaterThan(1);
 });
 test("a complete authenticated composer with no effort selector is Luna-only", async () => {
   const effortButton = {

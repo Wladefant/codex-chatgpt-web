@@ -8,25 +8,16 @@ import {
   loginToChatGpt,
   loginVerificationMarkerPath,
   sanitizeBrowserLoginStorageState,
+  chatGptLoginTimeoutError,
 } from "../src/browser-login";
 import { CHATGPT_TEMPORARY_CHAT_URL } from "../src/chatgpt-session";
 import { defaultConfig } from "../src/config";
 
-test("a bounded login timeout gives a safe challenge recovery action", async () => {
-  if (process.platform === "win32") return;
-  const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-login-timeout-"));
-  const executable = join(root, "fake-chrome");
-  writeFileSync(executable, "#!/bin/sh\nwhile :; do sleep 1; done\n", { mode: 0o700 });
-  chmodSync(executable, 0o700);
-  try {
-    const config = defaultConfig("browser-only");
-    config.chromeExecutablePath = executable;
-    config.storageStatePath = join(root, "browser", "storage-state.json");
-    await expect(loginToChatGpt(config, { timeoutMs: 50 }))
-      .rejects.toThrow("If ChatGPT shows a security check, complete it in Chrome and run codex-chatgpt-web login again");
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
+test("a bounded login timeout gives a safe challenge recovery action on every platform", () => {
+  const error = chatGptLoginTimeoutError(60_000);
+  expect(error.message).toContain("Chrome login timed out after 60000ms");
+  expect(error.message).toContain("complete it in Chrome");
+  expect(error.message).toContain("codex-chatgpt-web login again");
 });
 test("login starts with normal Chrome and captures state in a headed Keychain-aware context", async () => {
   if (process.platform === "win32") return;

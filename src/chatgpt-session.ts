@@ -255,6 +255,68 @@ export async function assertAuthenticatedChatGptPage(page: Page): Promise<void> 
   }
 }
 
+export const CHATGPT_SECURITY_CHALLENGE_WAIT_MS = 60_000;
+export const CHATGPT_SECURITY_CHALLENGE_POLL_MS = 1_000;
+
+export function hasChatGptSecurityChallengeSignal(signals: {
+  title: string;
+  bodyText: string;
+  visibleChallengeElementCount: number;
+}): boolean {
+  if (signals.visibleChallengeElementCount > 0) return true;
+  return /checking your browser|just a moment|attention required|security verification|verify you are human/i.test(signals.title)
+    || /checking your browser|complete (?:the )?(?:security|cloudflare) check|security verification|verify (?:that )?you are human|enable javascript and cookies to continue/i
+      .test(signals.bodyText);
+}
+
+export async function detectChatGptSecurityChallenge(page: Page): Promise<boolean> {
+  const signals = await page.evaluate(() => {
+    const selector = [
+      ".cf-turnstile",
+      "#cf-challenge-running",
+      "#challenge-form",
+      '[data-cf-challenge]',
+      'iframe[src*="challenges.cloudflare.com"]',
+      'input[name="cf-turnstile-response"]',
+    ].join(", ");
+    const visibleChallengeElementCount = [...document.querySelectorAll(selector)].filter(element => {
+      const style = getComputedStyle(element);
+      const bounds = element.getBoundingClientRect();
+      return element.isConnected
+        && style.display !== "none"
+        && style.visibility !== "hidden"
+        && style.opacity !== "0"
+        && bounds.width > 0
+        && bounds.height > 0;
+    }).length;
+    return {
+      title: document.title,
+      bodyText: document.body?.innerText?.slice(0, 10_000) ?? "",
+      visibleChallengeElementCount,
+    };
+  });
+  return hasChatGptSecurityChallengeSignal(signals);
+}
+export async function waitForChatGptSecurityChallenge(
+  page: Page,
+  options: { timeoutMs?: number; pollMs?: number } = {},
+): Promise<boolean> {
+  const timeoutMs = options.timeoutMs ?? CHATGPT_SECURITY_CHALLENGE_WAIT_MS;
+  const pollMs = options.pollMs ?? CHATGPT_SECURITY_CHALLENGE_POLL_MS;
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 0 || !Number.isFinite(pollMs) || pollMs < 1) {
+    throw new Error("ChatGPT security challenge wait requires a finite non-negative timeout and positive poll interval");
+  }
+  const deadline = Date.now() + timeoutMs;
+  let challengeVisible = await detectChatGptSecurityChallenge(page);
+  while (challengeVisible && Date.now() < deadline) {
+    const { promise, resolve } = Promise.withResolvers<void>();
+    setTimeout(resolve, Math.min(pollMs, deadline - Date.now()));
+    await promise;
+    challengeVisible = await detectChatGptSecurityChallenge(page);
+  }
+  return challengeVisible;
+}
+
 export async function assertTemporaryChatPage(page: Page): Promise<void> {
   const url = new URL(page.url());
   const expected = new URL(CHATGPT_TEMPORARY_CHAT_URL);

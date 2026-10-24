@@ -49,6 +49,7 @@ import {
 import { estimateCompiledChatGptWebInputTokens } from "./input-tokens";
 import {
   assertValidChatGptSession,
+  waitForChatGptSecurityChallenge,
   assertAuthenticatedChatGptPage,
   assertTemporaryChatPage,
   CHATGPT_ASSISTANT_TURN_SELECTOR,
@@ -1998,7 +1999,8 @@ class ChatGptBrowserDiagnostics {
       }
       const sequence = String(++this.sequence).padStart(2, "0");
       const stem = `${sequence}-${browserDiagnosticCheckpoint(checkpoint)}`;
-      const includeScreenshot = process.env.CODEX_CHATGPT_WEB_BROWSER_DIAGNOSTICS === "1";
+      const includeScreenshot = process.env.CODEX_CHATGPT_WEB_BROWSER_DIAGNOSTICS === "1"
+        || checkpoint === "security-challenge-remains";
       const [screenshotResult, stateResult] = await Promise.allSettled([
         includeScreenshot
           ? page.screenshot({ animations: "disabled", caret: "hide", timeout: 5_000, type: "png" })
@@ -2884,6 +2886,7 @@ export class ChatGptBrowserWorker {
   private async prepareTemporaryChatSurface(
     page: Page,
     captureDiagnostic?: (checkpoint: string) => Promise<void>,
+    challengeWaitOptions?: { timeoutMs?: number; pollMs?: number },
   ): Promise<Locator> {
     // Launcher verification refreshes its owned page before attaching Playwright so a newly added
     // connector is present in the catalog. Navigating again here destroys that freshly hydrated
@@ -2896,14 +2899,25 @@ export class ChatGptBrowserWorker {
       });
       await captureDiagnostic?.("temporary-chat-navigation-complete");
     }
+    if (await waitForChatGptSecurityChallenge(page, challengeWaitOptions)) {
+      if (captureDiagnostic) {
+        await captureDiagnostic("security-challenge-remains");
+      } else {
+        const diagnostics = new ChatGptBrowserDiagnostics(
+          `challenge_${randomUUID().replaceAll("-", "")}`,
+          this.config.browserDiagnosticsPath ?? join(getConfigDir(), "diagnostics", "browser-turns"),
+          this.config.appName,
+        );
+        await diagnostics.capture(page, "security-challenge-remains");
+      }
+      throw new ChatGptWebAdapterError(
+        "ChatGPT still shows a Cloudflare or Turnstile security challenge after waiting. Complete verification in the same Codex Web GPT bridge profile, then run `codex-chatgpt-web login` again. This turn stopped without interacting with the challenge.",
+        { status: 403, errorType: "authentication_error", code: "chatgpt_security_challenge", retryable: false },
+      );
+    }
     await throwIfChatGptSessionFailureAlert(page);
     await assertValidChatGptSession(page);
-    let composer: Locator;
-    try {
-      composer = await this.activeComposer(page);
-    } catch {
-      throw new Error("ChatGPT's Temporary Chat surface is unavailable although the session is signed in");
-    }
+    const composer = await this.activeComposer(page);
     if (await dismissChatGptTemporaryChatOnboarding(page)) {
       await captureDiagnostic?.("temporary-chat-onboarding-dismissed");
     }
