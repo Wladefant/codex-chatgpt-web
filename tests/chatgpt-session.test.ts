@@ -4,6 +4,7 @@ import {
   CHATGPT_ASSISTANT_TURN_SELECTOR,
   CHATGPT_COMPOSER_SELECTOR,
   CHATGPT_EFFORT_CONTROL_SELECTOR,
+  CHATGPT_EFFORT_ITEM_SELECTOR,
   CHATGPT_EFFORT_MENU_SELECTOR,
   CHATGPT_EFFORT_SLIDER_CONTAINER_SELECTOR,
   CHATGPT_SEND_BUTTON_SELECTOR,
@@ -468,7 +469,8 @@ function reasoningPicker(options: { max?: string; delay?: number; missing?: bool
   };
   const composer = { filter() { return this; }, last() { return this; }, isEditable: async () => true, locator: () => ({ locator: () => control }) };
   const modelRows = { count: async () => 3, first() { return this; }, waitFor: async () => {}, nth: () => { throw new Error("Model rows are not effort choices"); } };
-  const menu = { filter() { return this; }, last() { return this; }, isVisible: async () => true, locator: () => modelRows };
+  const effortItems = { filter() { return this; }, count: async () => 0 };
+  const menu = { filter() { return this; }, last() { return this; }, isVisible: async () => true, locator: (selector: string) => selector === CHATGPT_EFFORT_ITEM_SELECTOR ? effortItems : modelRows };
   const page = {
     url: () => "https://chatgpt.com/?temporary-chat=true",
     locator: (selector: string) => {
