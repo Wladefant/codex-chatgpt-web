@@ -30,3 +30,8 @@ test("diagnostic messages redact JSON-quoted, underscore, and Basic authorizatio
     expect(serialized).not.toContain(secret);
   }
 });
+test("diagnostic redaction consumes escaped quotes in JSON string values", () => {
+  const value = 'payload {"access_token":"prefix\\"escaped-tail-secret"}';
+  const record = serializeChatGptDiagnosticError(new Error(value));
+  expect(JSON.stringify(record)).not.toContain("escaped-tail-secret");
+});
