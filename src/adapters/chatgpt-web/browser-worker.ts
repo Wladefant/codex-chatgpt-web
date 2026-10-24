@@ -1913,11 +1913,11 @@ export function redactChatGptUiDiagnostic(value: string): string {
     .replace(/\b(?:https?|wss?|ftp):\/\/[^\s"'<>]+/gi, "[redacted-url]")
     .replace(/\bBearer\s+[^\s,;]+/gi, "Bearer [redacted]")
     .replace(
-      /((?<![A-Za-z0-9])["']?authorization["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\r\n,;}]+)/gi,
+      /((?<![A-Za-z0-9])["']?authorization["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|"(?:\\.|[^\r\n])*|'(?:\\.|[^\r\n])*|[^\r\n,;}]+)/gi,
       "$1[redacted]",
     )
     .replace(
-      /((?<![A-Za-z0-9])["']?(?:access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|oauth[_-]?token|session[_-]?token|token|(?:x-)?api[_-]?key|key|secret|password|passwd)["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;&}"']+)/gi,
+      /((?<![A-Za-z0-9])["']?(?:access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|oauth[_-]?token|session[_-]?token|token|(?:x-)?api[_-]?key|key|secret|password|passwd)["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|"(?:\\.|[^\r\n])*|'(?:\\.|[^\r\n])*|[^\s,;&}"']+)/gi,
       "$1[redacted]",
     )
     .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "[redacted-email]")

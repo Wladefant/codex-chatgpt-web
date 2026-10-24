@@ -35,3 +35,10 @@ test("diagnostic redaction consumes escaped quotes in JSON string values", () =>
   const record = serializeChatGptDiagnosticError(new Error(value));
   expect(JSON.stringify(record)).not.toContain("escaped-tail-secret");
 });
+test("diagnostic redaction consumes unterminated quoted values", () => {
+  const unterminated = serializeChatGptDiagnosticError(new Error('payload {"access_token":"unterminated-secret'));
+  const trailingBackslash = serializeChatGptDiagnosticError(new Error('payload {"session_token":"trailing-backslash\\'));
+  const serialized = JSON.stringify([unterminated, trailingBackslash]);
+  expect(serialized).not.toContain("unterminated-secret");
+  expect(serialized).not.toContain("trailing-backslash");
+});
